@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -14,7 +15,7 @@ from PIL import Image
 from pillow_heif import register_heif_opener
 
 import fotovibe.app as app_module
-from fotovibe.app import COOKIE, Settings, create_app
+from fotovibe.app import COOKIE, INVITE_COOKIE, Settings, create_app
 from fotovibe.storage import LocalStore
 from fotovibe.tasks import LocalTaskStore
 
@@ -225,6 +226,7 @@ def test_private_endpoints_and_cookie(env):
         "/api/session",
         "/api/photos",
         "/api/tasks/random",
+        "/api/gallery/archive",
         f"/api/photos/{photo_id}/original",
         f"/api/photos/{photo_id}/thumb",
     ]:
@@ -241,6 +243,36 @@ def test_private_endpoints_and_cookie(env):
     assert client.get("/api/photos").status_code == 401
 
 
+def test_gallery_archive_downloads_all_or_only_selected_originals(env):
+    client, _, _ = env
+    login(client)
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    first = picture(color="red")
+    second = picture(color="blue")
+    assert upload(client, data=first, photo_id=first_id).status_code == 201
+    assert upload(client, data=second, photo_id=second_id).status_code == 201
+
+    selected = client.get("/api/gallery/archive", params={"ids": first_id})
+    assert selected.status_code == 200
+    assert selected.headers["content-type"] == "application/zip"
+    assert selected.headers["content-disposition"] == 'attachment; filename="FotoVibe-Fotos.zip"'
+    with zipfile.ZipFile(io.BytesIO(selected.content)) as archive:
+        assert archive.namelist() == [f"FotoVibe-001-{first_id}.jpg"]
+        assert archive.read(archive.namelist()[0]) == first
+
+    complete = client.get("/api/gallery/archive")
+    assert complete.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(complete.content)) as archive:
+        names = archive.namelist()
+        assert len(names) == 2
+        assert any(first_id in name for name in names)
+        assert any(second_id in name for name in names)
+        assert {archive.read(name) for name in names} == {first, second}
+
+    assert client.get("/api/gallery/archive", params={"ids": str(uuid.uuid4())}).status_code == 404
+
+
 def test_origin_and_invalid_login(env):
     client, _, _ = env
     assert client.post("/api/session", json={"code": "TESTCODE"}).status_code == 403
@@ -253,6 +285,51 @@ def test_origin_and_invalid_login(env):
     assert client.post("/api/session", json={"code": "wrong"}, headers=ORIGIN).status_code == 401
     for bad in [{"code": []}, [], None]:
         assert client.post("/api/session", json=bad, headers=ORIGIN).status_code == 400
+
+
+def test_opaque_invite_link_starts_a_device_session_without_exposing_party_code(tmp_path):
+    invite_token = "invite_AbCdEf0123456789_-XYZ"
+    app = create_app(
+        Settings("VERY-SECRET-CODE", "test-signing-key", invite_token=invite_token),
+        LocalStore(tmp_path),
+    )
+    client = TestClient(app, base_url="https://testserver")
+
+    missing = client.get("/VERY-SECRET-CODE", follow_redirects=False)
+    assert missing.status_code == 404
+    assert INVITE_COOKIE not in missing.headers.get("set-cookie", "")
+
+    opened = client.get(f"/{invite_token}", follow_redirects=False)
+    assert opened.status_code == 303
+    assert opened.headers["location"] == "/"
+    invite_cookie = opened.headers["set-cookie"]
+    assert INVITE_COOKIE in invite_cookie
+    assert invite_token not in invite_cookie
+    assert "VERY-SECRET-CODE" not in invite_cookie
+    assert all(flag in invite_cookie for flag in ["HttpOnly", "SameSite=strict", "Max-Age=900"])
+    assert client.get("/api/session").status_code == 401
+
+    device_id = str(uuid.uuid4())
+    assert (
+        client.post("/api/session/invite", json={"device_id": device_id}).status_code == 403
+    )
+    accepted = client.post(
+        "/api/session/invite",
+        json={"device_id": device_id},
+        headers=ORIGIN,
+    )
+    assert accepted.status_code == 200
+    assert accepted.json() == {"authenticated": True, "user": None}
+    assert COOKIE in accepted.headers["set-cookie"]
+    assert client.get("/api/session").json() == {"authenticated": True, "user": None}
+    assert (
+        client.post(
+            "/api/session/invite",
+            json={"device_id": device_id},
+            headers=ORIGIN,
+        ).status_code
+        == 401
+    )
 
 
 def test_configured_test_code_uses_the_same_gallery(tmp_path):
@@ -461,6 +538,7 @@ def test_unknown_device_cannot_restore_and_name_is_set_once(env):
 
 def test_admin_can_hide_photos_and_review_every_registered_user(tmp_path):
     store = LocalStore(tmp_path)
+    invite_token = "admin_InviteToken0123456789XYZ"
     admin_device = str(uuid.uuid4())
     epoch = hashlib.sha256(b"TESTCODE").hexdigest()
     admin_key = hashlib.sha256(f"{epoch}:{admin_device}".encode()).hexdigest()
@@ -471,6 +549,7 @@ def test_admin_can_hide_photos_and_review_every_registered_user(tmp_path):
             True,
             (),
             ("d_" + admin_key[:12],),
+            invite_token=invite_token,
         ),
         store,
     )
@@ -519,6 +598,8 @@ def test_admin_can_hide_photos_and_review_every_registered_user(tmp_path):
     ).status_code == 400
     overview = admin.get("/api/admin/overview")
     assert overview.status_code == 200
+    assert overview.json()["invite_path"] == f"/{invite_token}"
+    assert "TEST-CODE" not in overview.text
     users = {user["id"]: user for user in overview.json()["users"]}
     assert users[admin_user["id"]]["is_admin"] is True
     assert users[guest_user["id"]]["values"] == {
@@ -542,6 +623,95 @@ def test_admin_can_hide_photos_and_review_every_registered_user(tmp_path):
     }[guest_user["id"]]
     assert hidden_user["values"]["photos_hidden"] == 1
     assert hidden_user["photos"][0]["hidden"] is True
+
+
+def test_admin_overview_batches_and_parallelizes_user_bucket_reads(tmp_path):
+    class ObservedStore(LocalStore):
+        def __init__(self, root):
+            super().__init__(root)
+            self.observing = False
+            self.calls_lock = threading.Lock()
+            self.list_calls = []
+            self.info_calls = []
+            self.active_profile_reads = 0
+            self.max_active_profile_reads = 0
+
+        def list_prefix(self, prefix):
+            if self.observing:
+                with self.calls_lock:
+                    self.list_calls.append(prefix)
+            return super().list_prefix(prefix)
+
+        def info(self, key):
+            if self.observing:
+                with self.calls_lock:
+                    self.info_calls.append(key)
+            return super().info(key)
+
+        def read(self, key):
+            profile_read = (
+                self.observing
+                and key.startswith("users/")
+                and key.endswith(".json")
+                and key.count("/") == 1
+            )
+            if profile_read:
+                with self.calls_lock:
+                    self.active_profile_reads += 1
+                    self.max_active_profile_reads = max(
+                        self.max_active_profile_reads,
+                        self.active_profile_reads,
+                    )
+                time.sleep(0.02)
+            try:
+                return super().read(key)
+            finally:
+                if profile_read:
+                    with self.calls_lock:
+                        self.active_profile_reads -= 1
+
+    store = ObservedStore(tmp_path)
+    device_ids = [str(uuid.uuid4()) for _ in range(10)]
+    epoch = hashlib.sha256(b"TESTCODE").hexdigest()
+    device_keys = [hashlib.sha256(f"{epoch}:{device_id}".encode()).hexdigest() for device_id in device_ids]
+    app = create_app(
+        Settings(
+            "TEST-CODE",
+            "test-signing-key",
+            True,
+            (),
+            ("d_" + device_keys[0][:12],),
+        ),
+        store,
+    )
+    clients = []
+    for index, (device_id, device) in enumerate(zip(device_ids, device_keys, strict=True)):
+        client = TestClient(app, base_url="https://testserver")
+        login_device(client, device_id)
+        assert client.post(
+            "/api/users/me",
+            json={"name": f"Gast {index + 1}"},
+            headers=ORIGIN,
+        ).status_code == 200
+        clients.append(client)
+        for _ in range(index % 3):
+            photo_id = str(uuid.uuid4())
+            store.put(
+                f"users/{device}/uploads/{photo_id}.json",
+                b"{}",
+                "application/json",
+            )
+
+    store.observing = True
+    overview = clients[0].get("/api/admin/overview")
+
+    assert overview.status_code == 200
+    assert len(overview.json()["users"]) == len(device_ids)
+    assert sum(user["values"]["photos_uploaded"] for user in overview.json()["users"]) == 9
+    assert store.list_calls.count("users/") == 1
+    assert not any(prefix.startswith("users/") and prefix.endswith("/uploads/") for prefix in store.list_calls)
+    assert not any(key.endswith("/reconciled-authors-v1.json") for key in store.info_calls)
+    assert store.max_active_profile_reads > 1
 
 
 def test_admin_can_block_a_device_and_approve_its_join_request(tmp_path):
@@ -947,6 +1117,24 @@ def test_originals_preserved_and_previews_metadata_free(env, fmt):
     assert len(store.published()) == 1
 
 
+def test_fresh_gallery_listing_avoids_reloading_manifest_for_thumbnail(env, monkeypatch):
+    client, _, store = env
+    login(client)
+    photo_id = upload(client).json()["id"]
+    assert client.get("/api/photos", params={"limit": 12}).status_code == 200
+    original_read = store.read
+    reads = []
+
+    def tracked_read(key):
+        reads.append(key)
+        return original_read(key)
+
+    monkeypatch.setattr(store, "read", tracked_read)
+
+    assert client.get(f"/api/photos/{photo_id}/thumb").status_code == 200
+    assert f"published/{photo_id}.json" not in reads
+
+
 def test_retry_is_idempotent_and_conflict_is_rejected(env):
     client, _, store = env
     login(client)
@@ -1026,6 +1214,11 @@ def test_pagination_is_stable_when_new_photo_arrives(env):
         )
     first = client.get("/api/photos").json()
     assert len(first["photos"]) == 30
+    compact = client.get("/api/photos", params={"limit": 12}).json()
+    assert len(compact["photos"]) == 12
+    assert compact["next_cursor"]
+    assert client.get("/api/photos", params={"limit": 5}).status_code == 400
+    assert client.get("/api/photos", params={"limit": 31}).status_code == 400
     assert upload(client).status_code == 201
     ids = [x["id"] for x in first["photos"]]
     cursor = first["next_cursor"]

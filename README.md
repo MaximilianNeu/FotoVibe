@@ -174,12 +174,13 @@ nur fehlende Dokumente angelegt; bereits in Firestore geänderte Texte bleiben
 erhalten. Die Website liefert Aufgaben ausschließlich nach erfolgreicher Anmeldung
 und berücksichtigt nur Dokumente mit `enabled=true`.
 
-Gäste können im Profilmenü eigene Freitext-Aufgaben hinzufügen. Diese werden
-sofort als aktive Aufgabe gespeichert und stehen damit direkt allen Gästen zur
-Auswahl. Im Admin-Panel gibt es zusätzlich den Tab „Aufgaben“: Dort lassen sich
-alle vorhandenen Aufgaben anlegen, bearbeiten oder löschen. Die Aufgaben liegen
-in Firestore (lokal in `.local/tasks.json`); das Deployment richtet dafür den
-schreibenden Firestore-Zugriff der Laufzeitidentität ein.
+Gäste können im Aufgaben-Auswahlfenster eigene Freitext-Aufgaben hinzufügen.
+Diese bleiben zunächst privat und stehen nur der Person zur Auswahl, die sie
+erstellt hat. Admins können sie später veröffentlichen. Im Admin-Panel gibt es
+zusätzlich den Tab „Aufgaben“: Dort lassen sich alle vorhandenen Aufgaben
+anlegen, bearbeiten oder löschen. Die Aufgaben liegen in Firestore (lokal in
+`.local/tasks.json`); das Deployment richtet dafür den schreibenden
+Firestore-Zugriff der Laufzeitidentität ein.
 
 Mit der vorhandenen gcloud-Anmeldung lassen sich Aufgaben ohne neues Deployment
 verwalten:
@@ -204,6 +205,22 @@ weiterhin den Aufgabenschlüssel direkt senden.
 
 ## Party-Code anzeigen oder wechseln
 
+Zusätzlich zum manuellen Party-Code erzeugt das Deployment einen eigenen,
+zufälligen Einladungslink. Er steht nach dem Deployment als `invite_url` in der
+lokalen Datei `.local/deployment.json` und wird am Ende von `make deploy`
+ausgegeben. Admins sehen denselben Link im Admin-Panel und können ihn dort direkt
+kopieren. Gäste, die diesen Link öffnen, landen nach der serverseitigen Prüfung
+direkt bei der Namenseingabe; der Party-Code selbst ist weder Bestandteil der URL
+noch für den Browser lesbar.
+
+Der lange URL-Token ist ein separater Zugangsschlüssel: Er lässt den Party-Code
+nicht erkennen, gewährt seinem Besitzer aber trotzdem Zugang zur Party und darf
+daher nur mit Gästen geteilt werden. Nach dem Aufruf wird er sofort aus der
+Adresszeile entfernt und in eine auf 15 Minuten begrenzte, signierte
+`HttpOnly`-Freigabe umgewandelt. Ungültige Links liefern nur einen 404-Fehler.
+`make deploy-rotate-code` ersetzt sowohl Party-Code als auch Einladungs-Token und
+macht alte Links und Sitzungen ungültig.
+
 Code der zuletzt erstellten Secret-Version anzeigen (nicht öffentlich teilen):
 
 ```sh
@@ -222,18 +239,18 @@ Deployment in `.local/deployment.json`.
 make deploy-rotate-code
 ```
 
-Erzeugt einen neuen zehnstelligen Code samt Sitzungsschlüssel und deployt ihn.
-Damit müssen sich alle Gäste erneut anmelden. Fotos bleiben erhalten.
+Erzeugt einen neuen zehnstelligen Code, Einladungs-Token und Sitzungsschlüssel
+und deployt sie. Damit müssen sich alle Gäste erneut anmelden. Fotos bleiben
+erhalten.
 Eine private lokale Kopie neu erzeugter Secrets liegt in `.local/auth.json`
 (Dateirechte `0600`, nicht für Git/Build vorgesehen).
 
 ## Admins und ausgeblendete Fotos
 
-Die drei Ausgangs-Admins (`d_df9eabe35ce8`, `d_41b14e411f97` und
-`d_d63b34eb51bf`) stehen als
-`admin_device_ids` im Auth-Secret. Die App vergleicht sie mit der im Profil
-angezeigten Geräte-ID; die Werte sind keine Namen und werden serverseitig
-geprüft. Änderungen an dieser Startliste werden
+Die in `DEFAULT_ADMIN_DEVICE_IDS` und `ADMIN_DEVICE_IDS` hinterlegten
+Ausgangs-Admins stehen als `admin_device_ids` im Auth-Secret. Die App vergleicht
+sie mit der party-spezifischen Gerätekennung des Browsers; die Werte sind keine
+Namen und werden serverseitig geprüft. Änderungen an dieser Startliste werden
 weiterhin mit `make deploy` ausgerollt. Zusätzlich können Admins im Panel Gäste
 zu Admins machen oder Adminrechte entziehen. Diese Änderungen werden als
 unveränderliche Rollenereignisse unter `admin_roles/<GERÄTE-HASH>/` gespeichert
@@ -264,9 +281,9 @@ Foto verschwindet aber aus Galerie und Fotobuch.
   Browser-Schließen verlorene Sitzung automatisch wiederherstellen. Die Kennung
   wird nur als party-spezifischer Hash gespeichert, nicht in der Galerie gezeigt.
   Das Löschen der Website-Daten im Browser entfernt diese Wiedererkennung.
-- Das Profilmenü zeigt für die Fehlersuche eine kurze Nutzer- und Geräte-ID. Das
-  ist eine zufällige, party-spezifische App-Kennung und keine Hardware-, Werbe-
-  oder Betriebssystem-ID. Im selben Menü steht die Zahl der von diesem Profil
+- Nutzer- und Geräte-IDs werden nicht im Profilmenü angezeigt. Sie bleiben
+  zufällige, party-spezifische App-Kennungen und sind keine Hardware-, Werbe-
+  oder Betriebssystem-IDs. Das Profilmenü zeigt die Zahl der von diesem Profil
   veröffentlichten Fotos.
 - Neue Fotos enthalten eine Momentaufnahme des gewählten Anzeigenamens. Damit
   bleibt sichtbar, wer ein Bild hochgeladen hat, auch wenn die Person später nicht
@@ -356,6 +373,10 @@ gcloud storage rm 'gs://fotovibe-520703150508-photos/photos/FOTO_UUID/**' \
 ```
 
 Galerielisten werden maximal fünf Sekunden serverseitig zwischengespeichert.
+Die Web-Galerie ruft zwölf Einträge pro Seite ab, priorisiert nur die ersten
+sichtbaren Vorschaubilder und lädt weitere Seiten kurz vor dem Scroll-Ende nach.
+Eine frische Galerieliste dient zugleich als kurzlebiger Veröffentlichungsnachweis,
+damit nicht für jedes Vorschaubild dasselbe Manifest erneut aus GCS gelesen wird.
 Bereits geöffnete Galerien können ein gelöschtes Vorschaubild bis zum Neuladen
 zeigen; der geschützte Bildabruf verweigert Zugriff ohne Veröffentlichungsdatensatz.
 Bereits heruntergeladene Originale lassen sich nicht zurückrufen.

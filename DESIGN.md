@@ -17,4 +17,7 @@ choice from the compact header theme button.
   replaces it with the normal private-task state.
 - Gallery tiles identify challenge photos with a short overlay; the photo detail
   view shows the complete saved task wording.
+- Gallery selection starts with a long press or an explicit compact control. Selected
+  tiles show a checked corner marker, and a safe-area-aware bottom bar groups select,
+  selected-download and download-all actions without covering the photo grid.
 - Very brief state transitions, disabled under prefers-reduced-motion.

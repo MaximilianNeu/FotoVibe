@@ -41,6 +41,7 @@ let adminTasks = null;
 let adminTab = 'users';
 let adminSearchTimer = null;
 let adminStreamSearchTimer = null;
+let adminInviteCopyTimer = null;
 let adminQuery = '';
 let adminStreamQuery = '';
 let adminStreamPhotos = [];
@@ -53,9 +54,22 @@ let activeDetailPhoto = null;
 let galleryQuery = '';
 let galleryMine = false;
 let gallerySearchTimer = null;
+let gallerySelectionMode = false;
+let galleryAllSelected = false;
+let galleryHasAnyPhotos = false;
+let gallerySelectionBusy = false;
+let galleryDownloadBusy = false;
+let preparedGalleryDownload = null;
+const selectedGalleryPhotos = new Map();
 let cameraStream = null;
 const handheldPointer = typeof window.matchMedia === 'function'
   && window.matchMedia('(pointer: coarse)').matches;
+const GALLERY_PAGE_SIZE = 12;
+const GALLERY_EAGER_IMAGES = handheldPointer ? 4 : 6;
+const GALLERY_LONG_PRESS_MS = 480;
+const GALLERY_LONG_PRESS_MOVE = 14;
+const GALLERY_NATIVE_SHARE_MAX_FILES = 24;
+const GALLERY_NATIVE_SHARE_MAX_BYTES = 96 * 1024 * 1024;
 // Phones start with the rear camera; laptops normally have one user-facing
 // webcam, so starting with `user` also enables its display-flash affordance.
 let cameraFacing = handheldPointer ? 'environment' : 'user';
@@ -820,20 +834,26 @@ function closeProfileMenu() {
 function showUser(user) {
   currentUser = user || null;
   $('profile-control').hidden = !currentUser;
-  if (!currentUser) return;
+  if (!currentUser) {
+    adminData = null;
+    clearAdminInvite();
+    return;
+  }
   $('profile-name').textContent = currentUser.name;
   $('profile-initial').textContent = currentUser.name.trim().charAt(0).toLocaleUpperCase('de') || '?';
-  $('profile-user-id').textContent = currentUser.id || '–';
-  $('profile-device-id').textContent = currentUser.device_id || '–';
   const uploaded = currentUser.values?.photos_uploaded;
   $('profile-upload-count').textContent = Number.isInteger(uploaded) && uploaded >= 0 ? String(uploaded) : '–';
   $('profile-admin-badge').hidden = !currentUser.is_admin;
   $('admin-open').hidden = !currentUser.is_admin;
+  if (!currentUser.is_admin) {
+    adminData = null;
+    clearAdminInvite();
+  }
 }
 
 function showLogin(message = '') {
   stopCamera(false);
-  document.body.classList.remove('review-open');
+  document.body.classList.remove('review-open', 'gallery-open');
   $('review').hidden = true;
   stopStream();
   authenticated = false;
@@ -849,7 +869,7 @@ function showLogin(message = '') {
 function showBlocked(message = 'Du wurdest aus dieser Party entfernt.') {
   stopCamera(false);
   closeChallengePicker(false);
-  document.body.classList.remove('review-open');
+  document.body.classList.remove('review-open', 'gallery-open');
   $('review').hidden = true;
   stopStream();
   authenticated = false;
@@ -1087,6 +1107,7 @@ async function enter(user, { offline = false } = {}) {
   $('boot').hidden = $('login').hidden = $('blocked').hidden = $('profile-setup').hidden = true;
   showUser(user);
   if (!currentUser) {
+    document.body.classList.remove('gallery-open');
     $('upload').hidden = $('gallery').hidden = $('stream').hidden = $('logout').hidden = true;
     $('profile-setup').hidden = false;
     $('profile-input').focus();
@@ -1104,6 +1125,7 @@ async function enter(user, { offline = false } = {}) {
     void synchronizeTaskCache().finally(() => scheduleQueueSync());
   }
   $(galleryPage ? 'gallery' : streamPage ? 'stream' : 'upload').hidden = false;
+  document.body.classList.toggle('gallery-open', galleryPage);
   if (!galleryPage && !streamPage && selected) showReviewShell();
   if (galleryPage) {
     if (offline) $('gallery-error').textContent = 'Ohne Netz sind nur neue Fotos verfügbar.';
@@ -1115,6 +1137,23 @@ async function enter(user, { offline = false } = {}) {
   }
   await refreshOutbox();
   return true;
+}
+
+async function enterFromPendingInvite() {
+  try {
+    const result = await api('/api/session/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: deviceId() }),
+    });
+    await enter(result.user);
+    return true;
+  } catch (error) {
+    if (error.blocked) return true;
+    if (error.status === 401) return false;
+    showLogin(error.message);
+    return true;
+  }
 }
 
 $('login-form').addEventListener('submit', async (event) => {
@@ -1220,34 +1259,6 @@ $('profile-form').addEventListener('submit', async (event) => {
   finally { $('profile-submit').disabled = false; $('profile-submit').innerHTML = 'Weiter zur Party <span aria-hidden="true">→</span>'; }
 });
 
-function closeTaskAdd() {
-  $('task-add-form').hidden = true;
-  $('task-add-open').hidden = false;
-  $('task-add-error').textContent = '';
-}
-
-$('task-add-open').addEventListener('click', () => {
-  $('task-add-open').hidden = true;
-  $('task-add-form').hidden = false;
-  $('task-add-status').textContent = '';
-  $('task-add-input').focus();
-});
-$('task-add-cancel').addEventListener('click', closeTaskAdd);
-$('task-add-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  $('task-add-error').textContent = '';
-  $('task-add-status').textContent = '';
-  $('task-add-submit').disabled = true;
-  try {
-    const task = await createPersonalTask($('task-add-input').value);
-    $('task-add-input').value = '';
-    $('task-add-status').textContent = task.pending_sync
-      ? 'Offline vorgemerkt. Wird automatisch synchronisiert, sobald du wieder Netz hast.'
-      : 'Privat gespeichert. Nur du bekommst diese Aufgabe zur Auswahl.';
-  } catch (error) { $('task-add-error').textContent = error.message; }
-  finally { $('task-add-submit').disabled = false; }
-});
-
 function adminReturnPage() {
   return galleryPage ? 'gallery' : streamPage ? 'stream' : 'upload';
 }
@@ -1262,6 +1273,67 @@ function adminMetric(label, value) {
   return item;
 }
 
+function clearAdminInvite() {
+  clearTimeout(adminInviteCopyTimer);
+  adminInviteCopyTimer = null;
+  $('admin-invite').hidden = true;
+  $('admin-invite-url').value = '';
+  $('admin-invite-url').placeholder = '';
+  $('admin-invite-copy').disabled = true;
+  $('admin-invite-copy').textContent = 'Link kopieren';
+  $('admin-invite-help').textContent = 'Jeder mit diesem Link kann der Party beitreten.';
+  $('admin-invite-status').textContent = '';
+}
+
+function renderAdminInvite(invitePath) {
+  clearAdminInvite();
+  const validPath = typeof invitePath === 'string'
+    && /^\/[A-Za-z0-9_-]{24,128}$/.test(invitePath);
+  $('admin-invite').hidden = false;
+  if (!validPath) {
+    $('admin-invite-url').placeholder = 'Noch nicht eingerichtet';
+    $('admin-invite-help').textContent = 'Der Einladungslink wird beim nächsten Deployment eingerichtet.';
+    return;
+  }
+  $('admin-invite-url').value = new URL(invitePath, location.origin).href;
+  $('admin-invite-copy').disabled = false;
+}
+
+async function copyAdminInvite() {
+  const input = $('admin-invite-url');
+  const button = $('admin-invite-copy');
+  const value = input.value;
+  if (!value || button.disabled) return;
+  clearTimeout(adminInviteCopyTimer);
+  button.disabled = true;
+  button.textContent = 'Wird kopiert …';
+  $('admin-invite-status').textContent = '';
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      input.focus();
+      input.select();
+      input.setSelectionRange(0, value.length);
+      if (!document.execCommand('copy')) throw new Error('copy failed');
+      button.focus();
+    }
+    button.textContent = 'Kopiert';
+    $('admin-invite-status').textContent = 'Einladungslink kopiert.';
+    adminInviteCopyTimer = setTimeout(() => {
+      button.textContent = 'Link kopieren';
+      button.disabled = false;
+    }, 2000);
+  } catch {
+    input.focus();
+    input.select();
+    input.setSelectionRange(0, value.length);
+    button.textContent = 'Link kopieren';
+    button.disabled = false;
+    $('admin-invite-status').textContent = 'Kopieren nicht möglich. Der Link ist zum manuellen Kopieren markiert.';
+  }
+}
+
 async function hidePhotoFromGallery(photoId, button, messageTarget) {
   if (!currentUser?.is_admin) return;
   if (!window.confirm('Dieses Foto wird nur aus der Galerie ausgeblendet. Die Dateien bleiben im Cloud Bucket erhalten.')) return;
@@ -1269,7 +1341,11 @@ async function hidePhotoFromGallery(photoId, button, messageTarget) {
   try {
     await api(`/api/admin/photos/${photoId}/hide`, { method: 'POST' });
     photos.delete(photoId);
+    selectedGalleryPhotos.delete(photoId);
+    galleryAllSelected = false;
+    resetPreparedGalleryDownload();
     document.querySelectorAll(`.photo-tile[data-photo-id="${photoId}"]`).forEach((tile) => tile.remove());
+    updateGalleryActionbar();
     messageTarget.textContent = 'Das Foto ist nicht mehr in der Galerie sichtbar.';
     $('detail-hide').hidden = true;
     if (!$('admin').hidden) await loadAdmin();
@@ -1848,9 +1924,11 @@ async function loadAdmin() {
   if (!currentUser?.is_admin) return;
   $('admin-error').textContent = '';
   $('admin-status').textContent = 'Daten werden geladen …';
+  clearAdminInvite();
   try {
     const result = await api('/api/admin/overview');
     adminData = result;
+    renderAdminInvite(result.invite_path);
     renderAdminUsers(result);
     renderAdminRequests(result);
     const blocked = result.values?.blocked || 0;
@@ -1880,6 +1958,7 @@ $('admin-search').addEventListener('input', () => {
 for (const name of ADMIN_TABS) {
   $(`admin-${name}-tab`).addEventListener('click', () => setAdminTab(name));
 }
+$('admin-invite-copy').addEventListener('click', copyAdminInvite);
 $('admin-task-create-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   $('admin-error').textContent = '';
@@ -2723,10 +2802,288 @@ async function loadDetailInteractions(photoId) {
   }
 }
 
+function gallerySelectionText() {
+  const count = selectedGalleryPhotos.size;
+  return `${count} ${count === 1 ? 'Foto ausgewählt' : 'Fotos ausgewählt'}`;
+}
+
+function resetPreparedGalleryDownload({ clearStatus = false } = {}) {
+  preparedGalleryDownload = null;
+  $('gallery-download-selected').classList.remove('is-ready');
+  $('gallery-download-all').classList.remove('is-ready');
+  $('gallery-download-selected').querySelector('span').textContent = 'Auswahl sichern';
+  $('gallery-download-all').querySelector('span').textContent = 'Alle sichern';
+  if (clearStatus) $('gallery-download-status').textContent = '';
+}
+
+function updateGallerySelectionTile(button) {
+  const selectedPhoto = selectedGalleryPhotos.has(button.dataset.photoId);
+  button.classList.toggle('is-selected', selectedPhoto);
+  if (gallerySelectionMode) {
+    button.setAttribute('aria-pressed', String(selectedPhoto));
+    button.setAttribute('aria-label', `${selectedPhoto ? 'Ausgewählt' : 'Nicht ausgewählt'}. ${button.dataset.openLabel}`);
+  } else {
+    button.removeAttribute('aria-pressed');
+    button.setAttribute('aria-label', button.dataset.openLabel);
+  }
+}
+
+function updateGalleryActionbar() {
+  $('photo-grid').classList.toggle('is-selecting', gallerySelectionMode);
+  $('gallery-selection-summary').hidden = !gallerySelectionMode;
+  $('gallery-download-selected').hidden = !gallerySelectionMode;
+  $('gallery-selection-count').textContent = gallerySelectionText();
+  const selectLabel = $('gallery-select-toggle').querySelector('span');
+  selectLabel.textContent = gallerySelectionBusy
+    ? 'Wird gewählt …'
+    : gallerySelectionMode
+      ? (galleryAllSelected ? 'Alle abwählen' : 'Alle wählen')
+      : 'Auswählen';
+  $('gallery-select-toggle').setAttribute('aria-label', selectLabel.textContent);
+  $('gallery-select-toggle').disabled = gallerySelectionBusy || galleryDownloadBusy || photos.size === 0;
+  $('gallery-download-selected').disabled = galleryDownloadBusy || selectedGalleryPhotos.size === 0;
+  $('gallery-download-all').disabled = galleryDownloadBusy || !galleryHasAnyPhotos;
+  $('gallery-selection-close').disabled = galleryDownloadBusy || gallerySelectionBusy;
+  for (const button of $('photo-grid').querySelectorAll('.photo-tile')) updateGallerySelectionTile(button);
+}
+
+function enterGallerySelection(photo = null) {
+  gallerySelectionMode = true;
+  if (photo) selectedGalleryPhotos.set(photo.id, photo);
+  galleryAllSelected = false;
+  resetPreparedGalleryDownload({ clearStatus: true });
+  updateGalleryActionbar();
+}
+
+function exitGallerySelection({ focus = false } = {}) {
+  if (!gallerySelectionMode && !selectedGalleryPhotos.size) return;
+  gallerySelectionMode = false;
+  galleryAllSelected = false;
+  selectedGalleryPhotos.clear();
+  resetPreparedGalleryDownload({ clearStatus: true });
+  updateGalleryActionbar();
+  if (focus) $('gallery-select-toggle').focus();
+}
+
+function toggleGalleryPhoto(photo, button) {
+  if (selectedGalleryPhotos.has(photo.id)) selectedGalleryPhotos.delete(photo.id);
+  else selectedGalleryPhotos.set(photo.id, photo);
+  galleryAllSelected = false;
+  resetPreparedGalleryDownload({ clearStatus: true });
+  updateGallerySelectionTile(button);
+  updateGalleryActionbar();
+}
+
+async function allGalleryPhotos({ query = '', mine = false } = {}) {
+  const found = [];
+  const seen = new Set();
+  let cursor = null;
+  do {
+    const parameters = new URLSearchParams({ limit: '30' });
+    if (cursor) parameters.set('cursor', cursor);
+    if (query) parameters.set('q', query);
+    if (mine) parameters.set('mine', '1');
+    const result = await api(`/api/photos?${parameters}`);
+    for (const photo of result.photos) {
+      if (!seen.has(photo.id)) {
+        seen.add(photo.id);
+        found.push(photo);
+      }
+    }
+    if (result.next_cursor && result.next_cursor === cursor) throw new Error('Die Galerie konnte nicht vollständig geladen werden.');
+    cursor = result.next_cursor;
+  } while (cursor);
+  return found;
+}
+
+async function selectAllGalleryPhotos() {
+  if (galleryAllSelected) {
+    selectedGalleryPhotos.clear();
+    galleryAllSelected = false;
+    resetPreparedGalleryDownload({ clearStatus: true });
+    updateGalleryActionbar();
+    return;
+  }
+  gallerySelectionBusy = true;
+  updateGalleryActionbar();
+  try {
+    const found = await allGalleryPhotos({ query: galleryQuery, mine: galleryMine });
+    selectedGalleryPhotos.clear();
+    for (const photo of found) selectedGalleryPhotos.set(photo.id, photo);
+    galleryAllSelected = found.length > 0;
+    resetPreparedGalleryDownload();
+    $('gallery-download-status').textContent = found.length
+      ? `${gallerySelectionText()}.`
+      : 'In dieser Ansicht gibt es keine Fotos.';
+  } catch (error) {
+    $('gallery-download-status').textContent = error.message;
+  } finally {
+    gallerySelectionBusy = false;
+    updateGalleryActionbar();
+  }
+}
+
+function galleryArchiveUrl(photoIds = null) {
+  if (!photoIds) return '/api/gallery/archive';
+  return `/api/gallery/archive?ids=${encodeURIComponent(photoIds.join(','))}`;
+}
+
+function startGalleryArchive(url) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'FotoVibe-Fotos.zip';
+  link.hidden = true;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  $('gallery-download-status').textContent = 'Die Originale werden als ZIP-Datei heruntergeladen.';
+}
+
+function nativeGalleryShareAvailable() {
+  if (typeof File === 'undefined' || typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') return false;
+  try {
+    const probe = new File([new Uint8Array([0])], 'FotoVibe.jpg', { type: 'image/jpeg' });
+    return navigator.canShare({ files: [probe] });
+  } catch {
+    return false;
+  }
+}
+
+function galleryDownloadKey(mode, photosToDownload) {
+  return mode === 'all' ? 'all' : `selected:${photosToDownload.map((photo) => photo.id).sort().join(',')}`;
+}
+
+function showPreparedGalleryDownload(mode, prepared) {
+  preparedGalleryDownload = prepared;
+  const button = $(mode === 'all' ? 'gallery-download-all' : 'gallery-download-selected');
+  button.classList.add('is-ready');
+  button.querySelector('span').textContent = prepared.files ? 'Jetzt sichern' : 'ZIP laden';
+  $('gallery-download-status').textContent = prepared.files
+    ? 'Bereit. Noch einmal tippen und „In Fotos sichern“ oder die Galerie-App wählen.'
+    : 'Für diese Menge ist eine ZIP-Datei zuverlässiger. Noch einmal tippen.';
+}
+
+async function prepareGalleryShare(photosToDownload, mode, key, archiveUrl) {
+  galleryDownloadBusy = true;
+  updateGalleryActionbar();
+  const files = new Array(photosToDownload.length);
+  let next = 0;
+  let completed = 0;
+  let totalBytes = 0;
+  try {
+    async function worker() {
+      while (next < photosToDownload.length) {
+        const index = next;
+        next += 1;
+        const photo = photosToDownload[index];
+        const response = await fetch(`/api/photos/${photo.id}/display`, { credentials: 'same-origin' });
+        if (!response.ok) throw new Error('Mindestens ein Foto konnte nicht vorbereitet werden.');
+        const blob = await response.blob();
+        totalBytes += blob.size;
+        if (totalBytes > GALLERY_NATIVE_SHARE_MAX_BYTES) throw new Error('gallery-share-too-large');
+        files[index] = new File([blob], `FotoVibe-${String(index + 1).padStart(3, '0')}.jpg`, {
+          type: 'image/jpeg',
+          lastModified: Date.now(),
+        });
+        completed += 1;
+        $('gallery-download-status').textContent = `${completed} von ${photosToDownload.length} Fotos werden vorbereitet …`;
+      }
+    }
+    const results = await Promise.allSettled(
+      Array.from({ length: Math.min(3, photosToDownload.length) }, worker),
+    );
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed) throw failed.reason;
+    let canShareFiles = false;
+    try { canShareFiles = navigator.canShare({ files }); } catch { /* The ZIP remains available. */ }
+    if (!canShareFiles) {
+      showPreparedGalleryDownload(mode, { mode, key, files: null, archiveUrl });
+      return;
+    }
+    showPreparedGalleryDownload(mode, { mode, key, files, archiveUrl });
+  } catch (error) {
+    if (error.message === 'gallery-share-too-large') {
+      showPreparedGalleryDownload(mode, { mode, key, files: null, archiveUrl });
+    } else {
+      $('gallery-download-status').textContent = error.message;
+    }
+  } finally {
+    galleryDownloadBusy = false;
+    updateGalleryActionbar();
+  }
+}
+
+async function usePreparedGalleryDownload(prepared) {
+  if (!prepared.files) {
+    startGalleryArchive(prepared.archiveUrl);
+    return;
+  }
+  $('gallery-download-status').textContent = 'Wähle im Teilen-Menü „In Fotos sichern“ oder deine Galerie-App.';
+  try {
+    await navigator.share({ files: prepared.files, title: 'FotoVibe Fotos' });
+    $('gallery-download-status').textContent = 'Die Fotos wurden an das gewählte Ziel übergeben.';
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      $('gallery-download-status').textContent = 'Sichern abgebrochen.';
+      return;
+    }
+    preparedGalleryDownload = { ...prepared, files: null };
+    const button = $(prepared.mode === 'all' ? 'gallery-download-all' : 'gallery-download-selected');
+    button.querySelector('span').textContent = 'ZIP laden';
+    $('gallery-download-status').textContent = 'Der Teilen-Dialog ist nicht verfügbar. Als ZIP herunterladen.';
+  }
+}
+
+async function downloadGalleryPhotos(mode) {
+  let photosToDownload = mode === 'all' ? [] : [...selectedGalleryPhotos.values()];
+  if (mode === 'selected' && !photosToDownload.length) return;
+  let key = galleryDownloadKey(mode, photosToDownload);
+  if (preparedGalleryDownload?.mode === mode && preparedGalleryDownload.key === key) {
+    await usePreparedGalleryDownload(preparedGalleryDownload);
+    return;
+  }
+  resetPreparedGalleryDownload();
+  const selectedIds = mode === 'selected' ? photosToDownload.map((photo) => photo.id) : null;
+  if (selectedIds?.length > 200) {
+    $('gallery-download-status').textContent = 'Bitte höchstens 200 Fotos auf einmal auswählen.';
+    return;
+  }
+  const archiveUrl = galleryArchiveUrl(selectedIds);
+  if (!nativeGalleryShareAvailable()) {
+    startGalleryArchive(archiveUrl);
+    return;
+  }
+  if (mode === 'all') {
+    galleryDownloadBusy = true;
+    $('gallery-download-status').textContent = 'Alle Fotos werden gezählt …';
+    updateGalleryActionbar();
+    try {
+      photosToDownload = await allGalleryPhotos();
+      key = galleryDownloadKey(mode, photosToDownload);
+    } catch (error) {
+      $('gallery-download-status').textContent = error.message;
+      return;
+    } finally {
+      galleryDownloadBusy = false;
+      updateGalleryActionbar();
+    }
+  }
+  if (!photosToDownload.length) {
+    $('gallery-download-status').textContent = 'In der Galerie sind noch keine Fotos.';
+    return;
+  }
+  if (photosToDownload.length > GALLERY_NATIVE_SHARE_MAX_FILES) {
+    showPreparedGalleryDownload(mode, { mode, key, files: null, archiveUrl });
+    updateGalleryActionbar();
+    return;
+  }
+  await prepareGalleryShare(photosToDownload, mode, key, archiveUrl);
+}
+
 /** Fill any element with the gallery tile's contents. The admin panel needs the
  * very same tile on a plain element, because it puts its own buttons on top and
  * a button may not contain buttons. */
-function fillPhotoTile(element, photo) {
+function fillPhotoTile(element, photo, { eager = false } = {}) {
   element.className = 'photo-tile';
   element.dataset.photoId = photo.id;
   const width = Number(photo.width);
@@ -2741,10 +3098,11 @@ function fillPhotoTile(element, photo) {
   const task = photo.task || photo.metadata?.task;
   const author = photo.author || photo.metadata?.author;
   const image = document.createElement('img');
-  image.src = `/api/photos/${photo.id}/thumb`;
   image.alt = `Partyfoto vom ${date}`;
-  image.loading = 'lazy';
+  image.loading = eager ? 'eager' : 'lazy';
+  image.fetchPriority = eager ? 'high' : 'auto';
   image.decoding = 'async';
+  image.src = `/api/photos/${photo.id}/thumb`;
   if (task?.text) {
     const label = document.createElement('span');
     label.className = 'photo-task-label';
@@ -2765,13 +3123,62 @@ function fillPhotoTile(element, photo) {
   return { date, task, author };
 }
 
-function photoButton(photo) {
+function photoButton(photo, options) {
   const button = document.createElement('button');
   button.type = 'button';
-  const { date, task, author } = fillPhotoTile(button, photo);
+  const { date, task, author } = fillPhotoTile(button, photo, options);
   const authorText = author?.name ? ` Hochgeladen von ${author.name}.` : '';
-  button.setAttribute('aria-label', task ? `Foto vom ${date} öffnen.${authorText} Aufgabe: ${task.text}` : `Foto vom ${date} öffnen.${authorText}`);
-  button.addEventListener('click', () => {
+  button.dataset.openLabel = task ? `Foto vom ${date} öffnen.${authorText} Aufgabe: ${task.text}` : `Foto vom ${date} öffnen.${authorText}`;
+  button.setAttribute('aria-label', button.dataset.openLabel);
+  const selectionMark = document.createElement('span');
+  selectionMark.className = 'photo-selection-mark';
+  selectionMark.setAttribute('aria-hidden', 'true');
+  selectionMark.innerHTML = '<svg viewBox="0 0 24 24"><path d="m6.5 12.5 3.4 3.4L17.8 8"/></svg>';
+  button.append(selectionMark);
+
+  let pressTimer = null;
+  let pressStart = null;
+  let suppressOpenUntil = 0;
+  const cancelPress = () => {
+    clearTimeout(pressTimer);
+    pressTimer = null;
+    pressStart = null;
+  };
+  const selectFromPress = () => {
+    if (!pressTimer || gallerySelectionMode) return;
+    cancelPress();
+    suppressOpenUntil = performance.now() + 700;
+    enterGallerySelection(photo);
+    try { navigator.vibrate?.(12); } catch { /* Haptics are optional. */ }
+  };
+  button.addEventListener('pointerdown', (event) => {
+    if (gallerySelectionMode || galleryDownloadBusy || event.button !== 0) return;
+    pressStart = { x: event.clientX, y: event.clientY, pointerType: event.pointerType };
+    pressTimer = setTimeout(selectFromPress, GALLERY_LONG_PRESS_MS);
+  });
+  button.addEventListener('pointermove', (event) => {
+    if (!pressTimer || !pressStart) return;
+    if (Math.hypot(event.clientX - pressStart.x, event.clientY - pressStart.y) > GALLERY_LONG_PRESS_MOVE) {
+      cancelPress();
+      return;
+    }
+    if (pressStart.pointerType === 'touch' && event.pressure >= 0.75) selectFromPress();
+  });
+  button.addEventListener('pointerup', cancelPress);
+  button.addEventListener('pointercancel', cancelPress);
+  button.addEventListener('pointerleave', (event) => {
+    if (event.pointerType === 'mouse') cancelPress();
+  });
+  button.addEventListener('contextmenu', (event) => event.preventDefault());
+  button.addEventListener('click', (event) => {
+    if (performance.now() < suppressOpenUntil) {
+      event.preventDefault();
+      return;
+    }
+    if (gallerySelectionMode) {
+      toggleGalleryPhoto(photo, button);
+      return;
+    }
     activeDetailPhoto = photo;
     detailButton = button;
     scrollPosition = window.scrollY;
@@ -2809,6 +3216,7 @@ function photoButton(photo) {
     window.scrollTo(0, 0);
     $('back-to-grid').focus();
   });
+  updateGallerySelectionTile(button);
   return button;
 }
 
@@ -3401,6 +3809,36 @@ function scheduleRefresh() {
   if (authenticated && galleryPage && !document.hidden) timer = setTimeout(() => loadGallery(false), 15000);
 }
 
+function setGalleryLoading(active, more) {
+  const firstPage = active && !more && !galleryLoaded && !photos.size;
+  $('gallery-overview').setAttribute('aria-busy', String(active));
+  $('photo-grid').setAttribute('aria-busy', String(active));
+  $('gallery-skeleton').hidden = !firstPage;
+  $('gallery-loading').hidden = !firstPage;
+  $('load-more').classList.toggle('is-loading', active && more);
+  $('load-more').setAttribute('aria-busy', String(active && more));
+  $('load-more').querySelector('.gallery-spinner').hidden = !(active && more);
+  $('load-more-label').textContent = active && more
+    ? 'Weitere Fotos werden geladen …'
+    : 'Weitere Fotos anzeigen';
+  $('gallery-load-announcement').textContent = active && more
+    ? 'Weitere Fotos werden geladen.'
+    : '';
+}
+
+function loadMoreIfNearViewport() {
+  if (!nextCursor || galleryBusy || document.hidden || $('gallery-overview').hidden) return;
+  const boundary = $('load-more').getBoundingClientRect();
+  if (boundary.top <= window.innerHeight + 320) void loadGallery(true);
+}
+
+const galleryLoadObserver = 'IntersectionObserver' in window
+  ? new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) loadMoreIfNearViewport();
+    }, { rootMargin: '320px 0px' })
+  : null;
+galleryLoadObserver?.observe($('load-more'));
+
 async function loadGallery(more) {
   if (galleryBusy || !authenticated) return;
   const requestedQuery = galleryQuery;
@@ -3408,8 +3846,10 @@ async function loadGallery(more) {
   galleryBusy = true;
   $('refresh').disabled = $('load-more').disabled = true;
   $('gallery-error').textContent = '';
+  setGalleryLoading(true, more);
   try {
     const parameters = new URLSearchParams();
+    parameters.set('limit', String(GALLERY_PAGE_SIZE));
     if (more && nextCursor) parameters.set('cursor', nextCursor);
     if (requestedQuery) parameters.set('q', requestedQuery);
     if (requestedMine) parameters.set('mine', '1');
@@ -3417,11 +3857,15 @@ async function loadGallery(more) {
     let result = await api('/api/photos' + query);
     if (requestedQuery !== galleryQuery || requestedMine !== galleryMine) return;
     let batch = [...result.photos];
+    if (!requestedQuery && !requestedMine && batch.length) galleryHasAnyPhotos = true;
     if (more || !galleryLoaded) nextCursor = result.next_cursor;
-    // Catch up even if over 30 photos arrive between polls, without resetting older pages.
+    // Catch up even if over one page arrives between polls, without resetting older pages.
     if (!more && galleryLoaded && photos.size) {
       while (result.next_cursor && !result.photos.some((photo) => photos.has(photo.id))) {
-        const catchup = new URLSearchParams({ cursor: result.next_cursor });
+        const catchup = new URLSearchParams({
+          cursor: result.next_cursor,
+          limit: String(GALLERY_PAGE_SIZE),
+        });
         if (requestedQuery) catchup.set('q', requestedQuery);
         if (requestedMine) catchup.set('mine', '1');
         result = await api('/api/photos?' + catchup);
@@ -3430,12 +3874,20 @@ async function loadGallery(more) {
       }
     } else if (!more && galleryLoaded && !photos.size) nextCursor = result.next_cursor;
     const fragment = document.createDocumentFragment();
+    let appended = 0;
     for (const photo of batch) {
       if (photos.has(photo.id)) continue;
       photos.set(photo.id, photo);
-      fragment.append(photoButton(photo));
+      fragment.append(photoButton(photo, {
+        eager: !more && !galleryLoaded && appended < GALLERY_EAGER_IMAGES,
+      }));
+      appended += 1;
     }
     if (more) $('photo-grid').append(fragment); else $('photo-grid').prepend(fragment);
+    if (appended) {
+      if (galleryAllSelected) galleryAllSelected = false;
+      if (preparedGalleryDownload?.mode === 'all') resetPreparedGalleryDownload({ clearStatus: true });
+    }
     galleryLoaded = true;
     $('gallery-empty').hidden = photos.size > 0;
     if (!photos.size && requestedMine && requestedQuery) {
@@ -3452,17 +3904,34 @@ async function loadGallery(more) {
       $('gallery-empty').querySelector('p').textContent = 'Mach den Anfang und teile ein Foto von der Party.';
     }
     $('load-more').hidden = !nextCursor;
+    updateGalleryActionbar();
   } catch (error) { $('gallery-error').textContent = error.message; }
   finally {
     galleryBusy = false;
     $('refresh').disabled = $('load-more').disabled = false;
+    setGalleryLoading(false, more);
     if (requestedQuery !== galleryQuery || requestedMine !== galleryMine) void loadGallery(false);
-    else scheduleRefresh();
+    else {
+      scheduleRefresh();
+      requestAnimationFrame(loadMoreIfNearViewport);
+    }
   }
 }
 
 $('refresh').addEventListener('click', () => loadGallery(false));
 $('load-more').addEventListener('click', () => loadGallery(true));
+$('gallery-select-toggle').addEventListener('click', () => {
+  if (gallerySelectionMode) void selectAllGalleryPhotos();
+  else enterGallerySelection();
+});
+$('gallery-selection-close').addEventListener('click', () => exitGallerySelection({ focus: true }));
+$('gallery-download-selected').addEventListener('click', () => void downloadGalleryPhotos('selected'));
+$('gallery-download-all').addEventListener('click', () => void downloadGalleryPhotos('all'));
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && gallerySelectionMode) exitGallerySelection({ focus: true });
+});
+updateGalleryActionbar();
+window.addEventListener('resize', loadMoreIfNearViewport);
 $('gallery-search-toggle').addEventListener('click', () => {
   const toggle = $('gallery-search-toggle');
   const opening = $('gallery-toolbar').hidden;
@@ -3473,6 +3942,7 @@ $('gallery-search-toggle').addEventListener('click', () => {
   if (opening) $('gallery-search').focus();
 });
 $('gallery-mine-toggle').addEventListener('click', () => {
+  exitGallerySelection();
   galleryMine = !galleryMine;
   $('gallery-mine-toggle').setAttribute('aria-pressed', String(galleryMine));
   nextCursor = null;
@@ -3487,6 +3957,7 @@ $('gallery-search').addEventListener('input', () => {
   gallerySearchTimer = setTimeout(() => {
     const query = $('gallery-search').value.trim();
     if (query === galleryQuery) return;
+    exitGallerySelection();
     galleryQuery = query;
     nextCursor = null;
     galleryLoaded = false;
@@ -3550,7 +4021,7 @@ try {
 }
 
 if (locallySignedOut) {
-  showLogin();
+  if (!await enterFromPendingInvite()) showLogin();
 } else {
   try {
     const activeSession = await api('/api/session');
@@ -3561,16 +4032,21 @@ if (locallySignedOut) {
     } else if (error.network && cachedOfflineUser) {
       await enter(cachedOfflineUser, { offline: true });
     } else {
-      try {
-        const restored = await api('/api/session/restore', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ device_id: deviceId() }),
-        });
-        await enter(restored.user);
-      } catch (restoreError) {
-        if (restoreError.network && cachedOfflineUser) await enter(cachedOfflineUser, { offline: true });
-        else if (!restoreError.blocked) showLogin(error.status === 401 ? '' : error.message);
+      const enteredFromInvite = await enterFromPendingInvite();
+      if (!enteredFromInvite) {
+        try {
+          const restored = await api('/api/session/restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_id: deviceId() }),
+          });
+          await enter(restored.user);
+        } catch (restoreError) {
+          if (restoreError.network && cachedOfflineUser) await enter(cachedOfflineUser, { offline: true });
+          else if (!restoreError.blocked) {
+            showLogin(error.status === 401 ? '' : error.message);
+          }
+        }
       }
     }
   }

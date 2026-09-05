@@ -10,8 +10,8 @@
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="stylesheet" href="/static/style.css?v=offline-tasks-v13">
-  <script src="/static/app.js?v=offline-tasks-v13" type="module"></script>
+  <link rel="stylesheet" href="/static/style.css?v=admin-invite-v18">
+  <script src="/static/app.js?v=admin-invite-v18" type="module"></script>
 </head>
 <body>
   <div id="page-backdrop" class="page-backdrop" aria-hidden="true" hidden></div>
@@ -37,19 +37,8 @@
         <div id="profile-menu" class="profile-menu" hidden>
           <p class="profile-label">Angemeldet als</p><strong id="profile-name"></strong><span id="profile-admin-badge" class="admin-badge" hidden>Admin</span>
           <dl class="profile-details">
-            <div><dt>Nutzer-ID</dt><dd><code id="profile-user-id"></code></dd></div>
-            <div><dt>Geräte-ID</dt><dd><code id="profile-device-id"></code></dd></div>
             <div class="profile-value"><dt>Hochgeladene Fotos</dt><dd id="profile-upload-count">0</dd></div>
           </dl>
-          <button id="task-add-open" class="secondary task-add-open" type="button">Eigene Aufgabe hinzufügen</button>
-          <form id="task-add-form" class="task-add-form" hidden>
-            <label for="task-add-input">Eigene Foto-Aufgabe</label>
-            <textarea id="task-add-input" maxlength="500" rows="3" placeholder="Zum Beispiel: Mach ein Foto mit deinem Lieblingsmenschen."></textarea>
-            <p class="hint">Nur du bekommst diese Aufgabe zur Auswahl. Admins können sie später veröffentlichen.</p>
-            <p id="task-add-error" class="error" role="alert"></p>
-            <p id="task-add-status" class="hint" role="status"></p>
-            <div class="task-add-actions"><button id="task-add-submit" class="primary" type="submit">Aufgabe speichern</button><button id="task-add-cancel" class="text-button" type="button">Abbrechen</button></div>
-          </form>
           <button id="admin-open" class="secondary admin-open" type="button" hidden>Admin-Panel öffnen</button>
           <button id="profile-logout" class="text-button" type="button">Abmelden</button>
           <div id="logout-pending" class="logout-pending" hidden>
@@ -185,7 +174,23 @@
         <p id="gallery-error" class="error" role="alert"></p>
         <div id="gallery-empty" class="empty" hidden><h2>Der erste Moment fehlt noch.</h2><p>Mach den Anfang und teile ein Foto von der Party.</p><a href="/" class="button primary">Erstes Foto teilen</a></div>
         <div id="photo-grid" class="photo-grid"></div>
-        <button id="load-more" class="secondary load-more" type="button" hidden>Weitere Fotos anzeigen</button>
+        <div id="gallery-skeleton" class="photo-grid gallery-skeleton" aria-hidden="true" hidden><span></span><span></span><span></span><span></span><span></span><span></span></div>
+        <div id="gallery-loading" class="gallery-loading" role="status" aria-live="polite" hidden><span class="gallery-spinner" aria-hidden="true"></span><span>Die ersten Fotos werden geladen …</span></div>
+        <button id="load-more" class="secondary load-more" type="button" hidden><span class="gallery-spinner" aria-hidden="true" hidden></span><span id="load-more-label">Weitere Fotos anzeigen</span></button>
+        <span id="gallery-load-announcement" class="sr-only" role="status" aria-live="polite"></span>
+        <aside id="gallery-actionbar" class="gallery-actionbar" aria-label="Galerie herunterladen">
+          <div id="gallery-selection-summary" class="gallery-selection-summary" hidden>
+            <strong id="gallery-selection-count">0 ausgewählt</strong>
+            <span>Tippe weitere Fotos an.</span>
+            <button id="gallery-selection-close" class="gallery-action-icon" type="button" aria-label="Auswahl beenden"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+          </div>
+          <div class="gallery-action-buttons">
+            <button id="gallery-select-toggle" class="gallery-action secondary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8 12 2.6 2.6L16.8 8.5"/></svg><span>Auswählen</span></button>
+            <button id="gallery-download-selected" class="gallery-action primary" type="button" hidden disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg><span>Auswahl sichern</span></button>
+            <button id="gallery-download-all" class="gallery-action secondary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7V4h10v3M5 10h14v10H5zM12 12v5m0 0 2-2m-2 2-2-2"/></svg><span>Alle sichern</span></button>
+          </div>
+          <p id="gallery-download-status" class="gallery-download-status" role="status" aria-live="polite"></p>
+        </aside>
       </div>
       <div id="photo-detail" hidden>
         <button id="back-to-grid" class="secondary" type="button">← Zurück zur Galerie</button>
@@ -217,7 +222,23 @@
       </div>
     </section>
     <section id="admin" class="admin-page" hidden aria-labelledby="admin-title">
-      <div class="admin-heading"><div><p class="eyebrow">Verwaltung</p><h1 id="admin-title">Party im Überblick.</h1><p id="admin-status" class="muted" role="status">Daten werden geladen …</p></div><button id="admin-back" class="secondary" type="button">← Zurück</button></div>
+      <div class="admin-heading">
+        <div class="admin-heading-content">
+          <p class="eyebrow">Verwaltung</p>
+          <h1 id="admin-title">Party im Überblick.</h1>
+          <p id="admin-status" class="muted" role="status">Daten werden geladen …</p>
+          <div id="admin-invite" class="admin-invite" hidden>
+            <label for="admin-invite-url">Einladungslink</label>
+            <div class="admin-invite-control">
+              <input id="admin-invite-url" type="url" readonly autocomplete="off" spellcheck="false" aria-describedby="admin-invite-help admin-invite-status">
+              <button id="admin-invite-copy" class="secondary" type="button">Link kopieren</button>
+            </div>
+            <p id="admin-invite-help" class="hint">Jeder mit diesem Link kann der Party beitreten.</p>
+            <p id="admin-invite-status" class="admin-invite-status" role="status" aria-live="polite"></p>
+          </div>
+        </div>
+        <button id="admin-back" class="secondary" type="button">← Zurück</button>
+      </div>
       <div class="admin-tabs" role="tablist" aria-label="Admin-Bereiche"><button id="admin-users-tab" type="button" role="tab" aria-selected="true" aria-controls="admin-users-pane">Gäste</button><button id="admin-requests-tab" type="button" role="tab" aria-selected="false" aria-controls="admin-requests-pane">Anfragen <span id="admin-requests-count" class="admin-tab-count" hidden></span></button><button id="admin-stream-tab" type="button" role="tab" aria-selected="false" aria-controls="admin-stream-pane">Stream</button><button id="admin-tasks-tab" type="button" role="tab" aria-selected="false" aria-controls="admin-tasks-pane">Aufgaben</button></div>
       <p id="admin-error" class="error" role="alert"></p>
       <section id="admin-users-pane" role="tabpanel" aria-labelledby="admin-users-tab"><label class="admin-search" for="admin-search"><span>Gäste durchsuchen</span><input id="admin-search" type="search" autocomplete="off" placeholder="Name, Nutzer- oder Geräte-ID suchen" aria-describedby="admin-search-hint"><small id="admin-search-hint">Durchsucht alle registrierten Party-Gäste.</small></label><div id="admin-summary" class="admin-summary" hidden></div><div id="admin-users" class="admin-users"></div><p id="admin-empty" class="admin-empty" hidden>Keine passenden Gäste gefunden.</p></section>

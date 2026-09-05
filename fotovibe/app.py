@@ -6,11 +6,14 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import threading
 import time
 import unicodedata
 import uuid
+import zipfile
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,7 +21,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from google.api_core.exceptions import GoogleAPIError
 from itsdangerous import BadSignature, URLSafeTimedSerializer
@@ -33,7 +43,10 @@ from .tasks import FirestoreTaskStore, LocalTaskStore
 ROOT = Path(__file__).resolve().parent.parent
 SESSION_AGE = 7 * 24 * 60 * 60
 COOKIE = "fotovibe_session"
+INVITE_COOKIE = "fotovibe_invite"
+INVITE_AGE = 15 * 60
 TASK_ID_PATTERN = re.compile(r"[a-z0-9-]{1,100}")
+INVITE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{24,128}")
 NAME_MAX_LENGTH = 40
 ADMIN_DEVICE_ID_PATTERN = re.compile(r"d_[a-f0-9]{12}")
 DEFAULT_ADMIN_DEVICE_IDS = (
@@ -41,6 +54,9 @@ DEFAULT_ADMIN_DEVICE_IDS = (
     "d_41b14e411f97",
     "d_d63b34eb51bf",
     "d_0f9d28b7b1bf",
+    "d_9507ec317a1a",
+    "d_a76821de5a21",
+    "d_376bce002323",
 )
 REACTIONS = {
     "heart": "❤️",
@@ -224,6 +240,7 @@ class Settings:
     test_codes: tuple[str, ...] = ()
     admin_device_ids: tuple[str, ...] = DEFAULT_ADMIN_DEVICE_IDS
     task_snapshot_key: str | None = None
+    invite_token: str | None = None
 
     @classmethod
     def from_env(cls):
@@ -244,6 +261,14 @@ class Settings:
             task_snapshot_key = values.get("task_snapshot_key", values["session_key"])
             if not isinstance(task_snapshot_key, str) or not task_snapshot_key:
                 raise RuntimeError("task_snapshot_key in AUTH_SECRET_FILE must be a non-empty string")
+            invite_token = values.get("invite_token")
+            if invite_token is not None and (
+                not isinstance(invite_token, str)
+                or INVITE_TOKEN_PATTERN.fullmatch(invite_token) is None
+            ):
+                raise RuntimeError(
+                    "invite_token in AUTH_SECRET_FILE must contain 24 to 128 URL-safe characters"
+                )
             return cls(
                 values["party_code"],
                 values["session_key"],
@@ -251,6 +276,7 @@ class Settings:
                 tuple(test_codes),
                 tuple(admin_device_ids),
                 task_snapshot_key,
+                invite_token,
             )
         if os.environ.get("FOTOVIBE_DEV") == "1":
             return cls(
@@ -260,6 +286,7 @@ class Settings:
                 ("1234",),
                 DEFAULT_ADMIN_DEVICE_IDS,
                 "development-only-task-snapshot-key",
+                os.environ.get("PARTY_INVITE_TOKEN", "dev-invite-token-only-1234"),
             )
         raise RuntimeError("AUTH_SECRET_FILE is required outside explicit local development")
 
@@ -315,7 +342,13 @@ class SecurityMiddleware:
                 )
         limit = (
             4096
-            if path in {"/api/session", "/api/session/restore", "/api/users/me"}
+            if path
+            in {
+                "/api/session",
+                "/api/session/invite",
+                "/api/session/restore",
+                "/api/users/me",
+            }
             else MAX_BYTES + 1024 * 1024
         )
         try:
@@ -376,6 +409,7 @@ def create_app(settings=None, store=None, task_store=None):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(SecurityMiddleware, secure=settings.secure_cookies)
     serializer = URLSafeTimedSerializer(settings.session_key, salt="fotovibe-session")
+    invite_grants = URLSafeTimedSerializer(settings.session_key, salt="fotovibe-invite-grant")
     cursors = URLSafeTimedSerializer(settings.session_key, salt="fotovibe-pages")
     task_snapshots = URLSafeTimedSerializer(
         settings.task_snapshot_key or settings.session_key,
@@ -390,7 +424,7 @@ def create_app(settings=None, store=None, task_store=None):
     conversion_locks_guard = threading.Lock()
     conversion_locks = {}
     cache_lock = threading.Lock()
-    cache = {"until": 0, "photos": []}
+    cache = {"until": 0, "photos": [], "photo_ids": frozenset()}
     access_cache_lock = threading.Lock()
     access_cache = {}
     app.state.serializer = serializer
@@ -632,6 +666,40 @@ def create_app(settings=None, store=None, task_store=None):
             httponly=True,
             samesite="strict",
             path="/",
+        )
+
+    def set_invite_cookie(response):
+        """Store only a short-lived signed grant after consuming the URL token."""
+        token = invite_grants.dumps({"epoch": epoch, "nonce": secrets.token_urlsafe(16)})
+        response.set_cookie(
+            INVITE_COOKIE,
+            token,
+            max_age=INVITE_AGE,
+            secure=settings.secure_cookies,
+            httponly=True,
+            samesite="strict",
+            path="/api/session/invite",
+        )
+
+    def invite_grant(request):
+        try:
+            grant = invite_grants.loads(
+                request.cookies.get(INVITE_COOKIE, ""),
+                max_age=INVITE_AGE,
+            )
+            if grant.get("epoch") != epoch or not isinstance(grant.get("nonce"), str):
+                raise BadSignature("invalid invite grant")
+        except (BadSignature, AttributeError, TypeError):
+            raise HTTPException(401, "Der Einladungslink ist ungültig oder abgelaufen.") from None
+        return grant
+
+    def clear_invite_cookie(response):
+        response.delete_cookie(
+            INVITE_COOKIE,
+            path="/api/session/invite",
+            secure=settings.secure_cookies,
+            httponly=True,
+            samesite="strict",
         )
 
     def valid_id(value):
@@ -1037,6 +1105,24 @@ def create_app(settings=None, store=None, task_store=None):
             entry["hot"] = entry["id"] in hot_ids
         return entries
 
+    def cached_gallery_entries():
+        """Return the short-lived gallery index and remember its verified photo IDs.
+
+        A gallery request is immediately followed by several thumbnail requests. The
+        listing has already verified those published markers, so keeping their IDs
+        alongside the five-second index avoids downloading the same manifest once per
+        thumbnail from object storage.
+        """
+        with cache_lock:
+            if cache["until"] <= time.monotonic():
+                entries = gallery_entries()
+                cache.update(
+                    photos=entries,
+                    photo_ids=frozenset(photo["id"] for photo in entries),
+                    until=time.monotonic() + 5,
+                )
+            return cache["photos"]
+
     def marker_payload(photo_id):
         return json.dumps(
             {
@@ -1081,12 +1167,13 @@ def create_app(settings=None, store=None, task_store=None):
                 "application/json",
             )
 
-    def user_profile(device, role_states=None, current_access_states=None):
-        user = user_for_device(device)
-        if user is None:
-            return None
-        reconcile_user_uploads(device, user)
-        photos_uploaded = len(store.list_prefix(user_upload_prefix(device)))
+    def user_profile_from_user(
+        device,
+        user,
+        photos_uploaded,
+        role_states=None,
+        current_access_states=None,
+    ):
         state = (
             current_access_states.get(device, {"blocked": False})
             if current_access_states is not None
@@ -1099,6 +1186,20 @@ def create_app(settings=None, store=None, task_store=None):
             "is_admin": is_admin(device, role_states),
             "blocked": bool(state.get("blocked", False)),
         }
+
+    def user_profile(device, role_states=None, current_access_states=None):
+        user = user_for_device(device)
+        if user is None:
+            return None
+        reconcile_user_uploads(device, user)
+        photos_uploaded = len(store.list_prefix(user_upload_prefix(device)))
+        return user_profile_from_user(
+            device,
+            user,
+            photos_uploaded,
+            role_states,
+            current_access_states,
+        )
 
     def stream_photo(entry):
         """The compact shape a screen needs to show and rank one photo.
@@ -1123,8 +1224,10 @@ def create_app(settings=None, store=None, task_store=None):
 
     def require_admin(request):
         data = session_data(request)
-        if not is_admin(data["device"]):
+        role_states = admin_role_states()
+        if not is_admin(data["device"], role_states):
             raise HTTPException(403, "Dieser Bereich ist nur für Admins.")
+        request.state.admin_role_states = role_states
         return data
 
     def pending_join_requests(current_access_states):
@@ -1167,11 +1270,21 @@ def create_app(settings=None, store=None, task_store=None):
         requests.sort(key=lambda item: item["requested_at"], reverse=True)
         return requests
 
-    def admin_overview():
-        role_states = admin_role_states()
-        current_access_states = access_states()
+    def admin_overview(role_states=None):
+        role_states = admin_role_states() if role_states is None else role_states
+
+        # These three bucket scans are independent. Running them together hides
+        # most of the round-trip latency between Cloud Run and the photo bucket.
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            access_future = executor.submit(access_states)
+            gallery_future = executor.submit(gallery_entries, True)
+            user_objects_future = executor.submit(store.list_prefix, "users/")
+            current_access_states = access_future.result()
+            gallery = gallery_future.result()
+            user_objects = user_objects_future.result()
+
         photos_by_author = {}
-        for photo in gallery_entries(include_hidden=True):
+        for photo in gallery:
             author = photo.get("author") or photo.get("metadata", {}).get("author")
             if isinstance(author, dict) and isinstance(author.get("id"), str):
                 photos_by_author.setdefault(author["id"], []).append(
@@ -1181,17 +1294,52 @@ def create_app(settings=None, store=None, task_store=None):
                         "hidden": photo["hidden"],
                     }
                 )
-        users = []
-        for obj in store.list_prefix("users/"):
+        root_objects = {}
+        upload_counts = {}
+        reconciled_devices = set()
+        for obj in user_objects:
             suffix = obj.name.removeprefix("users/")
-            if "/" in suffix or not suffix.endswith(".json"):
-                continue
-            device = suffix.removesuffix(".json")
+            device_part, separator, child = suffix.partition("/")
+            device = device_part.removesuffix(".json") if not separator else device_part
             if not re.fullmatch(r"[a-f0-9]{64}", device):
                 continue
-            profile = user_profile(device, role_states, current_access_states)
-            if profile is None:
+            if not separator and device_part.endswith(".json"):
+                root_objects[device] = obj
+            elif child == "reconciled-authors-v1.json":
+                reconciled_devices.add(device)
+            elif child.startswith("uploads/") and child.endswith(".json"):
+                upload_counts[device] = upload_counts.get(device, 0) + 1
+
+        def load_admin_profile(item):
+            device, obj = item
+            user = user_for_device(device)
+            if user is None:
+                return None
+            photos_uploaded = upload_counts.get(device, 0)
+            if device not in reconciled_devices:
+                # Compatibility for profiles created before upload markers existed.
+                reconcile_user_uploads(device, user)
+                photos_uploaded = len(store.list_prefix(user_upload_prefix(device)))
+            return obj, user_profile_from_user(
+                device,
+                user,
+                photos_uploaded,
+                role_states,
+                current_access_states,
+            )
+
+        # Profile files are small and independent. A bounded pool prevents the
+        # former one-user-at-a-time download waterfall without flooding GCS.
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            requests_future = executor.submit(pending_join_requests, current_access_states)
+            profiles = list(executor.map(load_admin_profile, root_objects.items()))
+            requests = requests_future.result()
+
+        users = []
+        for loaded in profiles:
+            if loaded is None:
                 continue
+            obj, profile = loaded
             uploads = photos_by_author.get(profile["id"], [])
             users.append(
                 {
@@ -1206,8 +1354,8 @@ def create_app(settings=None, store=None, task_store=None):
                 }
             )
         users.sort(key=lambda user: (user["name"].casefold(), user["id"]))
-        requests = pending_join_requests(current_access_states)
         return {
+            "invite_path": f"/{settings.invite_token}" if settings.invite_token else None,
             "users": users,
             "join_requests": requests,
             "values": {
@@ -1391,6 +1539,23 @@ def create_app(settings=None, store=None, task_store=None):
         set_session_cookie(response, device)
         return response
 
+    @app.post("/api/session/invite")
+    async def login_from_invite(request: Request):
+        invite_grant(request)
+        try:
+            payload = await request.json()
+            device = device_key(valid_device_id(payload.get("device_id")))
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(
+                400,
+                "Die Gerätekennung ist ungültig. Bitte den Einladungslink erneut öffnen.",
+            ) from None
+        reject_blocked_device(device, record_attempt=True)
+        response = JSONResponse({"authenticated": True, "user": user_profile(device)})
+        set_session_cookie(response, device)
+        clear_invite_cookie(response)
+        return response
+
     @app.post("/api/session/restore")
     async def restore_session(request: Request):
         try:
@@ -1451,7 +1616,7 @@ def create_app(settings=None, store=None, task_store=None):
     @app.get("/api/admin/overview")
     def admin_users(request: Request):
         require_admin(request)
-        return admin_overview()
+        return admin_overview(request.state.admin_role_states)
 
     @app.patch("/api/admin/users/{device_id}/role")
     async def admin_update_user_role(request: Request, device_id: str):
@@ -1740,10 +1905,7 @@ def create_app(settings=None, store=None, task_store=None):
         tiles the gallery does, and it carries both switches already.
         """
         require_admin(request)
-        with cache_lock:
-            if cache["until"] <= time.monotonic():
-                cache.update(photos=gallery_entries(), until=time.monotonic() + 5)
-            entries = cache["photos"]
+        entries = cached_gallery_entries()
         return {"photos": entries}
 
     @app.get("/api/photos/{photo_id}/interactions")
@@ -1988,10 +2150,13 @@ def create_app(settings=None, store=None, task_store=None):
         cursor: str | None = None,
         q: str | None = None,
         mine: bool = False,
+        limit: int = 30,
     ):
         data = session_data(request)
         if q is not None and (not isinstance(q, str) or len(q) > 100):
             raise HTTPException(400, "Die Suche ist zu lang.")
+        if limit < 6 or limit > 30:
+            raise HTTPException(400, "Die Seitengröße muss zwischen 6 und 30 liegen.")
         after = None
         if cursor:
             try:
@@ -2004,10 +2169,7 @@ def create_app(settings=None, store=None, task_store=None):
                     raise BadSignature("invalid cursor")
             except BadSignature:
                 raise HTTPException(400, "Die Galerie bitte neu laden.") from None
-        with cache_lock:
-            if cache["until"] <= time.monotonic():
-                cache.update(photos=gallery_entries(), until=time.monotonic() + 5)
-            entries = cache["photos"]
+        entries = cached_gallery_entries()
         if mine:
             user = user_for_device(data["device"])
             user_id = user["id"] if user else None
@@ -2037,9 +2199,11 @@ def create_app(settings=None, store=None, task_store=None):
             ]
         if after:
             entries = [x for x in entries if (x["created_at"], x["id"]) < tuple(after)]
-        page = entries[:30]
+        page = entries[:limit]
         next_cursor = (
-            cursors.dumps([page[-1]["created_at"], page[-1]["id"]]) if len(entries) > 30 else None
+            cursors.dumps([page[-1]["created_at"], page[-1]["id"]])
+            if len(entries) > limit
+            else None
         )
         return {"photos": page, "next_cursor": next_cursor}
 
@@ -2053,16 +2217,69 @@ def create_app(settings=None, store=None, task_store=None):
         returned with it, letting a screen correct its own drift.
         """
         session(request)
-        with cache_lock:
-            if cache["until"] <= time.monotonic():
-                cache.update(photos=gallery_entries(), until=time.monotonic() + 5)
-            entries = cache["photos"]
+        entries = cached_gallery_entries()
         return {
             "photos": [
                 stream_photo(entry) for entry in entries if entry.get("in_stream", True)
             ],
             "now": datetime.now(UTC).isoformat(),
         }
+
+    @app.get("/api/gallery/archive")
+    def gallery_archive(request: Request, ids: str | None = None):
+        """Download visible originals as one archive without buffering them in the browser."""
+        session(request)
+        entries = cached_gallery_entries()
+        if ids is not None:
+            requested_ids = list(dict.fromkeys(value for value in ids.split(",") if value))
+            if not requested_ids:
+                raise HTTPException(400, "Bitte mindestens ein Foto auswählen.")
+            if len(requested_ids) > 200:
+                raise HTTPException(400, "Bitte höchstens 200 Fotos auf einmal auswählen.")
+            for photo_id in requested_ids:
+                valid_id(photo_id)
+            visible = {entry["id"]: entry for entry in entries}
+            if any(photo_id not in visible for photo_id in requested_ids):
+                raise HTTPException(404, "Mindestens ein ausgewähltes Foto ist nicht mehr verfügbar.")
+            entries = [visible[photo_id] for photo_id in requested_ids]
+        if not entries:
+            raise HTTPException(404, "In der Galerie sind noch keine Fotos.")
+
+        # The response generator, rather than this request scope, owns the file lifetime.
+        archive = tempfile.SpooledTemporaryFile(  # noqa: SIM115
+            max_size=16 * 1024 * 1024, mode="w+b"
+        )
+        try:
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as bundle:
+                for index, entry in enumerate(entries, start=1):
+                    photo_id = entry["id"]
+                    record = manifest(photo_id)
+                    filename = f"FotoVibe-{index:03d}-{photo_id}.{record['extension']}"
+                    with bundle.open(filename, "w", force_zip64=True) as target:
+                        for chunk in store.stream(f"photos/{photo_id}/original"):
+                            target.write(chunk)
+            size = archive.tell()
+            archive.seek(0)
+        except Exception:
+            archive.close()
+            raise
+
+        def archive_chunks():
+            try:
+                while chunk := archive.read(256 * 1024):
+                    yield chunk
+            finally:
+                archive.close()
+
+        return StreamingResponse(
+            archive_chunks(),
+            media_type="application/zip",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": 'attachment; filename="FotoVibe-Fotos.zip"',
+                "Content-Length": str(size),
+            },
+        )
 
     def soft_variant(photo_id):
         """The blurred stream copy, built once from the thumbnail on first use.
@@ -2089,7 +2306,12 @@ def create_app(settings=None, store=None, task_store=None):
         valid_id(photo_id)
         if variant not in {"soft", "thumb", "display", "original"}:
             raise HTTPException(404, "Diese Bildversion gibt es nicht.")
-        record = manifest(photo_id)
+        with cache_lock:
+            recently_listed = cache["until"] > time.monotonic() and photo_id in cache["photo_ids"]
+        # The fresh gallery listing already verified the published marker. Only
+        # originals need its content type and extension; direct or older image
+        # requests retain the manifest check as before.
+        record = manifest(photo_id) if variant == "original" or not recently_listed else None
         if variant == "soft":
             data = await run_in_threadpool(soft_variant, photo_id)
             return Response(
@@ -2101,11 +2323,30 @@ def create_app(settings=None, store=None, task_store=None):
         headers = {"Cache-Control": "private, max-age=300", "Vary": "Cookie"}
         media_type = "image/jpeg"
         if variant == "original":
+            assert record is not None
             media_type = record["content_type"]
             headers["Content-Disposition"] = (
                 f'attachment; filename="FotoVibe-{photo_id}.{record["extension"]}"'
             )
         return StreamingResponse(store.stream(key), media_type=media_type, headers=headers)
+
+    @app.get("/{invite_token}", include_in_schema=False)
+    def open_invite(request: Request, invite_token: str):
+        """Exchange an opaque invite URL for a short-lived, HttpOnly grant."""
+        key = "invite-link:" + (request.client.host if request.client else "unknown")
+        limiter.check(key, 30, consume=False)
+        configured = settings.invite_token
+        valid = (
+            isinstance(configured, str)
+            and INVITE_TOKEN_PATTERN.fullmatch(invite_token) is not None
+            and secrets.compare_digest(invite_token, configured)
+        )
+        if not valid:
+            limiter.check(key, 30)
+            raise HTTPException(404, "Dieser Einladungslink ist nicht gültig.")
+        response = RedirectResponse("/", status_code=303)
+        set_invite_cookie(response)
+        return response
 
     app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
     return app

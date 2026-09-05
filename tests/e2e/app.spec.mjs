@@ -14,13 +14,23 @@ test('login surface fits the selected device viewport', async ({ page }) => {
 });
 
 test('a blocked device sees the dedicated access page and can retry', async ({ page }) => {
-  await page.route('**/api/session**', async (route) => {
-    await route.fulfill({
-      status: 403,
-      contentType: 'application/json',
-      headers: { 'X-FotoVibe-Reason': 'party-blocked' },
-      body: JSON.stringify({ detail: 'Du wurdest aus dieser Party entfernt.' }),
-    });
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (input, options = {}) => {
+      const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+      if (!['/api/session', '/api/session/restore'].includes(url.pathname)) {
+        return nativeFetch(input, options);
+      }
+      return Promise.resolve(new Response(JSON.stringify({
+        detail: 'Du wurdest aus dieser Party entfernt.',
+      }), {
+        status: 403,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-FotoVibe-Reason': 'party-blocked',
+        },
+      }));
+    };
   });
 
   await page.goto('/');
@@ -41,6 +51,111 @@ test('a local developer can reach the camera entry point', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Halte den Abend fest.' })).toBeVisible();
   await expect(page.getByRole('button', { name: /Foto aufnehmen/ }).first()).toBeVisible();
   await expect(page.locator('#local-cache')).toBeHidden();
+});
+
+test('the profile menu omits technical identifiers and personal task creation', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('Party-Code').fill('1234');
+  await page.getByRole('button', { name: /Dabei sein/ }).click();
+  await page.getByLabel('Dein Name').fill('Playwright Profil');
+  await page.getByRole('button', { name: /Weiter zur Party/ }).click();
+
+  await page.getByRole('button', { name: 'Profil öffnen' }).click();
+  const profileMenu = page.locator('#profile-menu');
+  await expect(profileMenu).toBeVisible();
+  await expect(profileMenu).not.toContainText('Nutzer-ID');
+  await expect(profileMenu).not.toContainText('Geräte-ID');
+  await expect(profileMenu.getByRole('button', { name: 'Eigene Aufgabe hinzufügen' })).toHaveCount(0);
+});
+
+test('an opaque invite link skips the party code and disappears from the address bar', async ({ page }) => {
+  await page.goto('/dev-invite-token-only-1234');
+  await expect(page).toHaveURL('/');
+  await expect(page.getByRole('heading', { name: 'Wie dürfen wir dich nennen?' })).toBeVisible();
+  await expect(page.getByLabel('Party-Code')).toBeHidden();
+
+  await page.getByLabel('Dein Name').fill('Playwright Einladung');
+  await page.getByRole('button', { name: /Weiter zur Party/ }).click();
+  await expect(page.getByRole('heading', { name: 'Halte den Abend fest.' })).toBeVisible();
+});
+
+test('admins can see and copy the current party invite link', async ({ page }) => {
+  const invitePath = '/admin_InviteToken0123456789XYZ';
+  await page.addInitScript((path) => {
+    const nativeFetch = window.fetch.bind(window);
+    const admin = {
+      id: 'u_admin1234567890',
+      name: 'Alex Admin',
+      device_id: 'd_admin12345678',
+      is_admin: true,
+      blocked: false,
+      values: { photos_uploaded: 0 },
+    };
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (value) => { window.__copiedInvite = value; } },
+    });
+    window.fetch = (input, options = {}) => {
+      const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+      const method = options.method || (typeof input === 'string' ? 'GET' : input.method);
+      if (url.pathname === '/api/session' && method === 'GET') {
+        return Promise.resolve(new Response(JSON.stringify({ authenticated: true, user: admin }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      if (url.pathname === '/api/tasks' && method === 'GET') {
+        return Promise.resolve(new Response(JSON.stringify({ tasks: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      if (url.pathname === '/api/admin/overview' && method === 'GET') {
+        return Promise.resolve(new Response(JSON.stringify({
+          invite_path: path,
+          users: [],
+          join_requests: [],
+          values: { users: 0, photos: 0, blocked: 0, join_requests: 0 },
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      return nativeFetch(input, options);
+    };
+  }, invitePath);
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Profil öffnen' }).click();
+  await page.getByRole('button', { name: 'Admin-Panel öffnen' }).click();
+
+  const expectedUrl = new URL(invitePath, page.url()).href;
+  await expect(page.getByLabel('Einladungslink')).toHaveValue(expectedUrl);
+  const layout = await page.evaluate(() => {
+    const insideViewport = (element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.left >= 0 && rect.right <= window.innerWidth + 1;
+    };
+    const input = document.getElementById('admin-invite-url');
+    const button = document.getElementById('admin-invite-copy');
+    return {
+      noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth + 1,
+      inputInside: insideViewport(input),
+      buttonInside: insideViewport(button),
+      inputFontSize: Number.parseFloat(getComputedStyle(input).fontSize),
+      buttonHeight: button.getBoundingClientRect().height,
+    };
+  });
+  expect(layout).toMatchObject({
+    noHorizontalOverflow: true,
+    inputInside: true,
+    buttonInside: true,
+  });
+  expect(layout.inputFontSize).toBeGreaterThanOrEqual(16);
+  expect(layout.buttonHeight).toBeGreaterThanOrEqual(44);
+  await page.getByRole('button', { name: 'Link kopieren' }).click();
+  await expect.poll(() => page.evaluate(() => window.__copiedInvite)).toBe(expectedUrl);
+  await expect(page.locator('#admin-invite-status')).toHaveText('Einladungslink kopiert.');
 });
 
 test('the task picker presents four mobile-friendly choices and a clear exit', async ({ page }) => {
@@ -286,10 +401,200 @@ test('the gallery keeps search collapsed and offers a personal quick filter', as
   await page.getByRole('button', { name: 'Suche öffnen' }).click();
   await expect(page.locator('#gallery-toolbar')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Von mir' })).toHaveAttribute('aria-pressed', 'false');
-  const mineRequest = page.waitForRequest((request) => request.url().includes('/api/photos?mine=1'));
+  const mineRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === '/api/photos' && url.searchParams.get('mine') === '1';
+  });
   await page.getByRole('button', { name: 'Von mir' }).click();
   await expect(page.getByRole('button', { name: 'Von mir' })).toHaveAttribute('aria-pressed', 'true');
   await mineRequest;
+});
+
+test('the gallery renders a compact first page before lazily loading the rest', async ({ page }) => {
+  const thumbnail = await readFile(new URL('../../static/party.jpg', import.meta.url));
+  const photos = Array.from({ length: 20 }, (_, index) => ({
+    id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+    created_at: new Date(Date.UTC(2026, 8, 5, 20, 0, 0) - index * 1000).toISOString(),
+    width: 900,
+    height: 1200,
+    author: { name: `Gast ${index + 1}` },
+    interactions: { reactions: [], comments_count: 0 },
+  }));
+  await page.addInitScript((galleryPhotos) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.__galleryListingRequests = [];
+    window.__releaseGalleryFirstPage = () => {};
+    window.__releaseGalleryNextPage = () => {};
+    window.fetch = (input, options = {}) => {
+      const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+      const method = options.method || input?.method || 'GET';
+      if (url.pathname !== '/api/photos' || method !== 'GET') return nativeFetch(input, options);
+      window.__galleryListingRequests.push(url.toString());
+      if (!url.searchParams.has('cursor')) {
+        return new Promise((resolve) => {
+          window.__releaseGalleryFirstPage = () => resolve(new Response(JSON.stringify({
+            photos: galleryPhotos.slice(0, 12), next_cursor: 'next-page',
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        });
+      }
+      return new Promise((resolve) => {
+        window.__releaseGalleryNextPage = () => resolve(new Response(JSON.stringify({
+          photos: galleryPhotos.slice(12), next_cursor: null,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      });
+    };
+  }, photos);
+
+  await page.route('**/api/photos/*/thumb', (route) => route.fulfill({
+    status: 200,
+    contentType: 'image/jpeg',
+    body: thumbnail,
+  }));
+  await page.goto('/gallery');
+  await page.getByLabel('Party-Code').fill('1234');
+  await page.getByRole('button', { name: /Dabei sein/ }).click();
+  await page.getByLabel('Dein Name').fill('Playwright Lazy Galerie');
+  await page.getByRole('button', { name: /Weiter zur Party/ }).click();
+
+  await expect(page.locator('#gallery-loading')).toBeVisible();
+  await expect(page.locator('#gallery-skeleton span').first()).toBeVisible();
+  await page.evaluate(() => window.__releaseGalleryFirstPage());
+  await expect(page.locator('#photo-grid .photo-tile')).toHaveCount(12);
+  const loadingModes = await page.locator('#photo-grid img').evaluateAll(
+    (images) => images.map((image) => image.loading),
+  );
+  const eagerCount = await page.evaluate(
+    () => matchMedia('(pointer: coarse)').matches ? 4 : 6,
+  );
+  expect(loadingModes.filter((mode) => mode === 'eager')).toHaveLength(eagerCount);
+  expect(loadingModes.filter((mode) => mode === 'lazy')).toHaveLength(12 - eagerCount);
+  const firstRequest = await page.evaluate(() => window.__galleryListingRequests[0]);
+  expect(new URL(firstRequest).searchParams.get('limit')).toBe('12');
+  await page.locator('#load-more').scrollIntoViewIfNeeded();
+  await expect.poll(() => page.evaluate(
+    () => window.__galleryListingRequests.some((url) => new URL(url).searchParams.has('cursor')),
+  )).toBe(true);
+  await expect(page.getByRole('button', { name: 'Weitere Fotos werden geladen …' })).toBeVisible();
+  await page.evaluate(() => window.__releaseGalleryNextPage());
+  await expect(page.locator('#photo-grid .photo-tile')).toHaveCount(20);
+  await expect(page.locator('#load-more')).toBeHidden();
+});
+
+test('a long press starts gallery selection and taps add more photos', async ({ page }) => {
+  const thumbnail = await readFile(new URL('../../static/party.jpg', import.meta.url));
+  const galleryPhotos = Array.from({ length: 3 }, (_, index) => ({
+    id: `10000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+    created_at: new Date(Date.UTC(2026, 8, 5, 21, index)).toISOString(),
+    width: 900,
+    height: 1200,
+    author: { name: `Gast ${index + 1}` },
+    interactions: { reactions: [], comments_count: 0 },
+  }));
+  await page.addInitScript((photos) => {
+    Object.defineProperty(Navigator.prototype, 'share', { value: undefined, configurable: true });
+    Object.defineProperty(Navigator.prototype, 'canShare', { value: undefined, configurable: true });
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (input, options = {}) => {
+      const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+      const method = options.method || input?.method || 'GET';
+      if (url.pathname === '/api/photos' && method === 'GET') {
+        return Promise.resolve(new Response(JSON.stringify({ photos, next_cursor: null }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      if (/^\/api\/photos\/[^/]+\/display$/.test(url.pathname) && method === 'GET') {
+        return nativeFetch('/static/party.jpg');
+      }
+      return nativeFetch(input, options);
+    };
+  }, galleryPhotos);
+  await page.route('**/api/photos/*/thumb', (route) => route.fulfill({
+    status: 200,
+    contentType: 'image/jpeg',
+    body: thumbnail,
+  }));
+  await page.route('**/api/gallery/archive?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/zip',
+    headers: { 'Content-Disposition': 'attachment; filename="FotoVibe-Fotos.zip"' },
+    body: Buffer.from('archive'),
+  }));
+
+  await page.goto('/gallery');
+  await page.getByLabel('Party-Code').fill('1234');
+  await page.getByRole('button', { name: /Dabei sein/ }).click();
+  await page.getByLabel('Dein Name').fill('Playwright Auswahl');
+  await page.getByRole('button', { name: /Weiter zur Party/ }).click();
+  const tiles = page.locator('#photo-grid .photo-tile');
+  await expect(tiles).toHaveCount(3);
+
+  await tiles.first().dispatchEvent('pointerdown', {
+    pointerId: 7, pointerType: 'touch', button: 0, clientX: 20, clientY: 20, pressure: 0.5,
+  });
+  await page.waitForTimeout(520);
+  await tiles.first().dispatchEvent('pointerup', {
+    pointerId: 7, pointerType: 'touch', button: 0, clientX: 20, clientY: 20, pressure: 0,
+  });
+  await expect(page.locator('#photo-grid')).toHaveClass(/is-selecting/);
+  await expect(tiles.first()).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#gallery-selection-count')).toHaveText('1 Foto ausgewählt');
+
+  await tiles.nth(1).click();
+  await expect(tiles.nth(1)).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#gallery-selection-count')).toHaveText('2 Fotos ausgewählt');
+  await expect(page.getByRole('button', { name: 'Auswahl sichern' })).toBeEnabled();
+
+  await page.setViewportSize({ width: 320, height: 568 });
+  const compactActions = await page.evaluate(() => {
+    const bar = document.getElementById('gallery-actionbar').getBoundingClientRect();
+    const buttons = [...document.querySelectorAll('#gallery-actionbar button:not([hidden])')]
+      .map((button) => button.getBoundingClientRect());
+    return {
+      barInside: bar.left >= 0 && bar.right <= innerWidth && bar.top >= 0 && bar.bottom <= innerHeight,
+      buttonsAreTouchable: buttons.every((button) => button.height >= 44 && button.width >= 44),
+      noHorizontalOverflow: document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+    };
+  });
+  expect(compactActions).toEqual({
+    barInside: true,
+    buttonsAreTouchable: true,
+    noHorizontalOverflow: true,
+  });
+
+  const archiveDownload = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Auswahl sichern' }).click();
+  const download = await archiveDownload;
+  const requestedIds = new URL(download.url()).searchParams.get('ids').split(',');
+  expect(requestedIds).toHaveLength(2);
+  expect(download.suggestedFilename()).toBe('FotoVibe-Fotos.zip');
+  await download.cancel();
+
+  await page.getByRole('button', { name: 'Alle wählen' }).click();
+  await expect(page.locator('#gallery-selection-count')).toHaveText('3 Fotos ausgewählt');
+  await expect.poll(() => tiles.evaluateAll(
+    (buttons) => buttons.map((button) => button.getAttribute('aria-pressed')),
+  )).toEqual(['true', 'true', 'true']);
+
+  await page.evaluate(() => {
+    window.__sharedGalleryFiles = 0;
+    Object.defineProperty(navigator, 'canShare', { value: ({ files }) => files?.length > 0, configurable: true });
+    Object.defineProperty(navigator, 'share', {
+      value: ({ files }) => {
+        window.__sharedGalleryFiles = files.length;
+        return Promise.resolve();
+      },
+      configurable: true,
+    });
+  });
+  await page.getByRole('button', { name: 'Auswahl sichern' }).click();
+  await expect(page.getByRole('button', { name: 'Jetzt sichern' })).toBeVisible();
+  await page.getByRole('button', { name: 'Jetzt sichern' }).click();
+  await expect.poll(() => page.evaluate(() => window.__sharedGalleryFiles)).toBe(3);
+
+  await page.getByRole('button', { name: 'Auswahl beenden' }).click();
+  await expect(page.locator('#gallery-selection-summary')).toBeHidden();
+  await expect(tiles.first()).not.toHaveAttribute('aria-pressed');
 });
 
 test('Chromium opens the camera shell with the fake webcam', async ({ page, browserName }, testInfo) => {

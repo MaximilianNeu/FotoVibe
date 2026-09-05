@@ -24,9 +24,10 @@ If a guest uses a photo task, the selected wording is saved with the photo and
 shown in the gallery. This association is historical: later task edits do not
 rewrite the meaning of an existing photo.
 
-The compact profile menu exposes small party-scoped user and device identifiers
-for support, plus extensible per-party values such as the number of photos that
-profile has successfully published.
+The compact profile menu shows the guest's name, admin status where applicable,
+and extensible per-party values such as the number of photos that profile has
+successfully published. Party-scoped user and device identifiers remain internal
+support and admin data.
 
 ## Brand Personality
 Simple, welcoming, clear. German interface. Photography is the focus.

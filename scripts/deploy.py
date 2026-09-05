@@ -17,7 +17,14 @@ SERVICE = "fotovibe"
 BUCKET = "fotovibe-520703150508-photos"
 AUTH_SECRET = "fotovibe-auth"
 TEST_CODE = "1234"
-ADMIN_DEVICE_IDS = ("d_df9eabe35ce8", "d_41b14e411f97", "d_d63b34eb51bf")
+ADMIN_DEVICE_IDS = (
+    "d_df9eabe35ce8",
+    "d_41b14e411f97",
+    "d_d63b34eb51bf",
+    "d_9507ec317a1a",
+    "d_a76821de5a21",
+    "d_376bce002323",
+)
 FIRESTORE_DATABASE = "fotovibe"
 DNS_ZONE = "zone-180-foto-com"
 DOMAINS = ("180-foto.com", "www.180-foto.com")
@@ -336,6 +343,7 @@ def main():
             snapshot_key = secrets.token_urlsafe(48)
         values = {
             "party_code": code[:5] + "-" + code[5:],
+            "invite_token": secrets.token_urlsafe(24),
             "session_key": secrets.token_urlsafe(48),
             "task_snapshot_key": snapshot_key,
             "test_codes": [TEST_CODE],
@@ -365,6 +373,19 @@ def main():
         ):
             raise RuntimeError("Existing auth secret has invalid test_codes")
         changed = False
+        configured_invite_token = values.get("invite_token")
+        if configured_invite_token is None:
+            values["invite_token"] = secrets.token_urlsafe(24)
+            changed = True
+        elif (
+            not isinstance(configured_invite_token, str)
+            or not 24 <= len(configured_invite_token) <= 128
+            or not all(
+                character.isascii() and (character.isalnum() or character in "_-")
+                for character in configured_invite_token
+            )
+        ):
+            raise RuntimeError("Existing auth secret has an invalid invite_token")
         if not isinstance(values.get("task_snapshot_key"), str) or not values["task_snapshot_key"]:
             values["task_snapshot_key"] = secrets.token_urlsafe(48)
             changed = True
@@ -462,6 +483,7 @@ def main():
                 "storage_region": STORAGE_REGION,
                 "bucket": BUCKET,
                 "url": f"https://{DOMAINS[0]}",
+                "invite_url": f"https://{DOMAINS[0]}/{values['invite_token']}",
                 "service_url": url,
                 "domains": list(DOMAINS),
                 "secret_version": version,
@@ -472,6 +494,7 @@ def main():
     print(
         f"Service URL: {url}\n"
         f"Upload: https://{DOMAINS[0]}\n"
+        f"Invite: https://{DOMAINS[0]}/{values['invite_token']}\n"
         f"Gallery: https://{DOMAINS[0]}/gallery\n"
         f"Party code is stored in Secret Manager ({AUTH_SECRET}, version {version}).\n"
         "On the first deployment, Google-managed HTTPS certificates can take time to become active.",

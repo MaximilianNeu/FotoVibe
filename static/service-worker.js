@@ -1,9 +1,9 @@
-const CACHE = 'fotovibe-shell-v13';
+const CACHE = 'fotovibe-shell-v18';
 const SHELL = [
   '/',
   '/static/index.html',
-  '/static/style.css?v=offline-tasks-v13',
-  '/static/app.js?v=offline-tasks-v13',
+  '/static/style.css?v=admin-invite-v18',
+  '/static/app.js?v=admin-invite-v18',
   '/static/offline-store.js',
   '/static/vendor/heic-to.js',
   '/static/party.jpg',
