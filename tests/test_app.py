@@ -1096,7 +1096,7 @@ def test_local_task_store_keeps_personal_tasks_owner_scoped_until_published(tmp_
     assert promoted["created_by_name"] == "Bea"
 
 
-@pytest.mark.parametrize("fmt", ["JPEG", "PNG", "WEBP", "HEIF"])
+@pytest.mark.parametrize("fmt", ["JPEG", "PNG", "WEBP", "HEIF", "AVIF"])
 def test_originals_preserved_and_previews_metadata_free(env, fmt):
     client, _, store = env
     login(client)

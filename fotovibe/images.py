@@ -14,6 +14,7 @@ FORMATS = {
     "PNG": ("image/png", "png"),
     "WEBP": ("image/webp", "webp"),
     "HEIF": ("image/heic", "heic"),
+    "AVIF": ("image/avif", "avif"),
 }
 # The stream shows a dozen photos receding into the distance and softens the far
 # ones. Doing that with a CSS blur costs a repaint every time perspective
@@ -42,7 +43,9 @@ def derivatives(raw: bytes):
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(raw)) as source:
                 if source.format not in FORMATS:
-                    raise HTTPException(415, "Bitte ein JPEG-, PNG-, WebP- oder HEIC-Foto wählen.")
+                    raise HTTPException(
+                        415, "Bitte ein JPEG-, PNG-, WebP-, HEIC- oder AVIF-Foto wählen."
+                    )
                 content_type, extension = FORMATS[source.format]
                 if source.width * source.height > MAX_PIXELS:
                     raise HTTPException(413, "Dieses Foto hat mehr als 64 Megapixel.")

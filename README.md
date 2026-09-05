@@ -267,13 +267,20 @@ Foto verschwindet aber aus Galerie und Fotobuch.
 
 ## Fotos und Datenschutz
 
-- JPEG, PNG, WebP, HEIC/HEIF, maximal 25 MiB und 64 Millionen Pixel je Datei.
-- Ein Foto pro Upload. Keine Videos, RAW-Dateien oder animierten PNG/WebP.
-- Die App speichert genau die Datei, die der Browser übergibt. Das Betriebssystem
-  kann bereits vor der Übergabe Formate umwandeln oder die Aufnahme begrenzen.
-- Originale werden nicht verändert. Anzeigeversion (max. 2560 px) und Thumbnail
-  (max. 640 px) sind JPEGs mit korrigierter Orientierung und ohne EXIF/GPS.
-- Originale können EXIF/GPS enthalten und sind für alle mit Party-Code downloadbar.
+- Der Fotobibliothek-Picker akzeptiert alle Bildtypen. JPEG bleibt im Original
+  erhalten; andere vom Browser lesbare Formate sowie HEIC/HEIF werden für einen
+  zuverlässigen Upload als statisches JPEG-Cover gespeichert. Serverseitig sind
+  auch JPEG, PNG, WebP, HEIC/HEIF und AVIF zulässig.
+- Ein Foto pro Upload, maximal 25 MiB und 64 Millionen Pixel. Keine separaten
+  Videos oder RAW-Dateien. Bei Live-/Motion-Photos wird das statische Cover
+  angezeigt; eingebettete Bewegungsdaten eines JPEG-Originals bleiben erhalten.
+- Das Betriebssystem kann bereits vor der Übergabe Formate umwandeln oder die
+  Aufnahme begrenzen.
+- Übernommene JPEG-Originale werden nicht verändert. Anzeigeversion (max. 2560 px)
+  und Thumbnail (max. 640 px) sind JPEGs mit korrigierter Orientierung und ohne
+  EXIF/GPS.
+- Übernommene JPEG-Originale können EXIF/GPS enthalten und sind für alle mit
+  Party-Code downloadbar; normalisierte Cover enthalten diese Metadaten nicht.
 - Der Party-Code ist ein gemeinsamer Zugang, keine persönliche Identifizierung.
   Wer ihn erhält, kann ihn weitergeben. Ersetze ihn nach Bedarf.
 - Beim ersten Beitritt erzeugt der Browser eine zufällige Kennung und speichert sie
@@ -439,7 +446,8 @@ Vor der Feier auf **echtem iPhone/Safari und Android/Chrome** prüfen:
    Vorschau verschieben, aus dem Bild schieben und wieder einblenden.
 3. Hoch- und Querformat im Vollbild aufnehmen, zur Kamera zurückgehen, erneut
    aufnehmen und den Upload bestätigen.
-4. JPEG und vorhandenes HEIC aus der Bibliothek auswählen; Vorschau abwarten.
+4. JPEG, HEIC/Live Photo und ein weiteres Bildformat aus der Bibliothek auswählen;
+   Vorschau abwarten und prüfen, dass jeweils das statische Cover hochgeladen wird.
 5. Upload, Erfolg, Galerie auf zweitem Gerät und Original-Download prüfen.
 6. Schlechtes Netz/Verbindungsabbruch testen: Fehlermeldung, Wiederholung, kein Duplikat.
 7. In Messenger-internen Browsern bei Problemen in Safari/Chrome wechseln.

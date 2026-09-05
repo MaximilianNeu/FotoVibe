@@ -53,6 +53,33 @@ test('a local developer can reach the camera entry point', async ({ page }) => {
   await expect(page.locator('#local-cache')).toBeHidden();
 });
 
+test('the photo library turns any browser-readable image into an uploadable cover', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('Party-Code').fill('1234');
+  await page.getByRole('button', { name: /Dabei sein/ }).click();
+  await page.getByLabel('Dein Name').fill('Playwright Bildformat');
+  await page.getByRole('button', { name: /Weiter zur Party/ }).click();
+
+  const input = page.locator('#library-input');
+  await expect(input).toHaveAttribute('accept', 'image/*,.heic,.heif,.avif');
+  await input.setInputFiles({
+    name: 'bewegtes-foto.gif',
+    mimeType: 'image/gif',
+    buffer: Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64'),
+  });
+  await expect(page.locator('#preview')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Foto hochladen' })).toBeEnabled();
+
+  const uploadResponse = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === '/api/photos' && response.request().method() === 'POST'
+  ));
+  await page.getByRole('button', { name: 'Foto hochladen' }).click();
+  const response = await uploadResponse;
+  expect(response.ok()).toBe(true);
+  expect(response.request().headers()['content-type']).toBe('image/jpeg');
+  await expect(response.json()).resolves.toMatchObject({ content_type: 'image/jpeg', extension: 'jpg' });
+});
+
 test('the profile menu omits technical identifiers and personal task creation', async ({ page }) => {
   await page.goto('/');
   await page.getByLabel('Party-Code').fill('1234');

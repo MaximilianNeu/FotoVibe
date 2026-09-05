@@ -2498,6 +2498,51 @@ async function convertHeic(file) {
   return module.heicTo({ blob: file, type: 'image/jpeg', quality: 0.75 });
 }
 
+function jpegName(name) {
+  const base = String(name || 'Foto').replace(/\.[^.]+$/, '') || 'Foto';
+  return `${base}.jpg`;
+}
+
+function jpegFile(blob, original) {
+  return new File([blob], jpegName(original.name), {
+    type: 'image/jpeg',
+    lastModified: original.lastModified || Date.now(),
+  });
+}
+
+function isJpeg(file) {
+  const type = String(file.type || '').toLowerCase();
+  return type === 'image/jpeg' || (!type && /\.jpe?g$/i.test(file.name || ''));
+}
+
+function canvasJpeg(image, maxEdge = 4096, quality = 0.9) {
+  const scale = Math.min(1, maxEdge / Math.max(image.naturalWidth, image.naturalHeight));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext('2d');
+  // JPEG has no transparency. Match the neutral background used by the server
+  // instead of letting transparent PNG/WebP pixels turn black.
+  context.fillStyle = '#f7f6f2';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      canvas.width = canvas.height = 1;
+      if (blob) resolve(blob);
+      else reject(new Error('Aus diesem Foto konnte kein statisches Vorschaubild erstellt werden.'));
+    }, 'image/jpeg', quality);
+  });
+}
+
+async function staticUploadFile(file, image, convertedHeic = null) {
+  // JPEG may contain an embedded Android Motion Photo. Keeping its original
+  // bytes preserves that data even though FotoVibe currently shows its cover.
+  if (isJpeg(file)) return file;
+  if (convertedHeic) return jpegFile(convertedHeic, file);
+  return jpegFile(await canvasJpeg(image), file);
+}
+
 async function selectPhoto(file, source = 'library', mirrored = false) {
   clearSelection();
   selectionSource = source;
@@ -2505,7 +2550,6 @@ async function selectPhoto(file, source = 'library', mirrored = false) {
   const generation = previewGeneration;
   if (file.size > MAX_BYTES) { $('upload-error').textContent = 'Dieses Foto ist größer als 25 MiB. Bitte ein anderes wählen.'; return; }
   if (!file.size) { $('upload-error').textContent = 'Die Datei ist leer. Bitte ein anderes Foto wählen.'; return; }
-  selected = file;
   previewMirrored = mirrored;
   selectedTask = taskForUpload(currentTask);
   selectedUploadMetadata = {
@@ -2514,23 +2558,31 @@ async function selectPhoto(file, source = 'library', mirrored = false) {
     queued_at: Date.now(),
     ...(selectedTask?.id ? { task_id: selectedTask.id } : {}),
   };
-  const bytesPromise = blobBytes(file);
   let url = URL.createObjectURL(file);
   try {
-    const bytes = await bytesPromise;
-    if (generation !== previewGeneration) { URL.revokeObjectURL(url); return; }
-    selectedBytes = bytes;
     let image;
+    let convertedHeic = null;
     try { image = await decodeImage(url); }
     catch {
-      if (!/heic|heif/i.test(file.type + file.name)) throw new Error('Dieses Bild lässt sich nicht anzeigen. Bitte ein JPEG-, PNG-, WebP- oder HEIC-Foto wählen.');
+      if (!/heic|heif/i.test(file.type + file.name)) throw new Error('Dieses Bild lässt sich nicht anzeigen. Bitte ein anderes Foto wählen.');
       URL.revokeObjectURL(url);
-      const converted = await convertHeic(file);
-      url = URL.createObjectURL(converted);
+      convertedHeic = await convertHeic(file);
+      url = URL.createObjectURL(convertedHeic);
       image = await decodeImage(url);
     }
     if (generation !== previewGeneration) { URL.revokeObjectURL(url); return; }
     if (image.naturalWidth * image.naturalHeight > 64_000_000) throw new Error('Dieses Foto hat mehr als 64 Megapixel. Bitte ein anderes wählen.');
+    const uploadFile = await staticUploadFile(file, image, convertedHeic);
+    if (generation !== previewGeneration) { URL.revokeObjectURL(url); return; }
+    if (uploadFile.size > MAX_BYTES) throw new Error('Das statische Foto ist größer als 25 MiB. Bitte ein anderes wählen.');
+    const uploadBytes = await blobBytes(uploadFile);
+    if (generation !== previewGeneration) { URL.revokeObjectURL(url); return; }
+    selected = uploadFile;
+    selectedBytes = uploadBytes;
+    if (uploadFile !== file && !convertedHeic) {
+      URL.revokeObjectURL(url);
+      url = URL.createObjectURL(uploadFile);
+    }
     previewUrl = url;
     $('preview').src = url;
     $('preview').classList.toggle('is-mirrored', previewMirrored);

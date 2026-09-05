@@ -10,8 +10,8 @@
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="stylesheet" href="/static/style.css?v=admin-invite-v18">
-  <script src="/static/app.js?v=admin-invite-v18" type="module"></script>
+  <link rel="stylesheet" href="/static/style.css?v=photo-formats-v19">
+  <script src="/static/app.js?v=photo-formats-v19" type="module"></script>
 </head>
 <body>
   <div id="page-backdrop" class="page-backdrop" aria-hidden="true" hidden></div>
@@ -155,7 +155,7 @@
         <button id="camera" class="primary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5 6.5 8H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-2.5L16 5Z"/><circle cx="12" cy="14" r="4"/></svg>Foto aufnehmen</button>
         <button id="library" class="secondary" type="button">Aus Fotobibliothek wählen</button>
         <input id="camera-input" type="file" accept="image/*" capture="environment" hidden>
-        <input id="library-input" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif" hidden>
+        <input id="library-input" type="file" accept="image/*,.heic,.heif,.avif" hidden>
       </div>
       <button id="local-cache" class="local-cache" type="button" hidden disabled aria-controls="queue-menu" aria-label="Keine Fotos lokal vorgemerkt">
         <span aria-hidden="true">☁</span><span id="local-cache-text">0 / 25 vorgemerkt</span>
