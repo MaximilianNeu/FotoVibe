@@ -10,8 +10,8 @@
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="stylesheet" href="/static/style.css?v=stream-curation-v8">
-  <script src="/static/app.js?v=stream-curation-v8" type="module"></script>
+  <link rel="stylesheet" href="/static/style.css?v=hot-search-v10">
+  <script src="/static/app.js?v=hot-search-v10" type="module"></script>
 </head>
 <body>
   <div id="page-backdrop" class="page-backdrop" aria-hidden="true" hidden></div>
@@ -127,7 +127,7 @@
         <div class="gallery-heading"><div><p class="eyebrow">Aus euren Perspektiven</p><h1 id="gallery-title">Unser Abend in Bildern.</h1></div><div class="gallery-actions"><button id="gallery-search-toggle" class="gallery-icon-button secondary" type="button" aria-expanded="false" aria-controls="gallery-toolbar" aria-label="Suche öffnen"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.2"></circle><path d="m16 16 4.3 4.3"></path></svg><span class="sr-only">Suche öffnen</span></button><button id="refresh" class="gallery-icon-button secondary" type="button" aria-label="Galerie aktualisieren"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.8-4.2L3 9"></path><path d="M3 4v5h5"></path><path d="M4 13a8 8 0 0 0 14.8 4.2L21 15"></path><path d="M21 20v-5h-5"></path></svg><span class="sr-only">Galerie aktualisieren</span></button></div></div>
         <div id="gallery-toolbar" class="gallery-toolbar" hidden>
           <div class="gallery-search-row">
-            <label class="gallery-search" for="gallery-search"><span>Fotos durchsuchen</span><input id="gallery-search" type="search" autocomplete="off" placeholder="Name oder Foto-Aufgabe suchen"></label>
+            <label class="gallery-search" for="gallery-search"><span>Fotos durchsuchen</span><input id="gallery-search" type="search" autocomplete="off" placeholder="Name, Aufgabe oder „hot" suchen"></label>
             <button id="gallery-mine-toggle" class="quick-filter secondary" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.1"></circle><path d="M5.5 19a6.5 6.5 0 0 1 13 0"></path></svg><span>Von mir</span></button>
           </div>
         </div>
@@ -161,7 +161,7 @@
           </form>
         </section>
         <a id="download" class="button primary" download>Original herunterladen <span aria-hidden="true">↓</span></a>
-        <button id="detail-pin" class="secondary admin-pin-action" type="button" hidden aria-pressed="false">Im Stream anpinnen</button>
+        <button id="detail-pin" class="secondary admin-pin-action" type="button" hidden aria-pressed="false">Als Hot markieren</button>
         <button id="detail-hide" class="secondary admin-hide-action" type="button" hidden>Aus Galerie entfernen</button>
       </div>
     </section>
@@ -174,7 +174,7 @@
         <p class="admin-pane-intro">Der Stream läuft von allein. Alle zehn Fotos schiebt er ein Hot-Foto dazwischen. Hot wird ein Foto, wenn die Party darauf reagiert hat — oder wenn ihr es anpinnt. Beides zählt gleich viel.</p>
         <div id="admin-stream-summary" class="admin-summary" hidden></div>
         <p id="admin-stream-status" class="muted" role="status"></p>
-        <label class="admin-search" for="admin-stream-search"><span>Fotos durchsuchen</span><input id="admin-stream-search" type="search" autocomplete="off" placeholder="Name oder Aufgabe suchen" aria-describedby="admin-stream-search-hint"><small id="admin-stream-search-hint">Foto antippen, dann als Hot markieren oder vom Stream verstecken. Versteckte Fotos bleiben in der Galerie.</small></label>
+        <label class="admin-search" for="admin-stream-search"><span>Fotos durchsuchen</span><input id="admin-stream-search" type="search" autocomplete="off" placeholder="Name, Aufgabe oder „hot" suchen" aria-describedby="admin-stream-search-hint"><small id="admin-stream-search-hint">Foto antippen, dann als Hot markieren oder vom Stream verstecken. Versteckte Fotos bleiben in der Galerie.</small></label>
         <div id="admin-stream-all" class="photo-grid"></div>
         <p id="admin-stream-none" class="admin-empty" hidden>Keine passenden Fotos gefunden.</p>
       </section>

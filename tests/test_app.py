@@ -475,7 +475,7 @@ def test_admin_can_hide_photos_and_review_every_registered_user(tmp_path):
     assert hidden_user["photos"][0]["hidden"] is True
 
 
-def test_admin_pins_photos_onto_the_stream_and_takes_them_off_again(tmp_path):
+def test_hot_comes_from_reactions_and_from_admin_rulings_together(tmp_path):
     store = LocalStore(tmp_path)
     admin_device = str(uuid.uuid4())
     epoch = hashlib.sha256(b"TESTCODE").hexdigest()
@@ -491,54 +491,66 @@ def test_admin_pins_photos_onto_the_stream_and_takes_them_off_again(tmp_path):
     admin.post("/api/users/me", json={"name": "Alex"}, headers=ORIGIN)
     login_device(guest, str(uuid.uuid4()))
     guest.post("/api/users/me", json={"name": "Bea"}, headers=ORIGIN)
-    photo_id = str(uuid.uuid4())
-    assert upload(guest, photo_id=photo_id).status_code == 201
+
+    quiet = str(uuid.uuid4())
+    loved = str(uuid.uuid4())
+    for photo_id in (quiet, loved):
+        assert upload(guest, photo_id=photo_id).status_code == 201
 
     def streamed():
         return {photo["id"]: photo for photo in guest.get("/api/photos/stream").json()["photos"]}
 
-    assert streamed()[photo_id]["pinned"] is False
-    assert streamed()[photo_id]["comments"] == 0
+    def hot_count():
+        return sum(1 for photo in streamed().values() if photo["hot"])
 
+    # Nothing has happened yet, so nothing is hot.
+    assert streamed()[quiet]["hot"] is False
+    assert streamed()[loved]["hot"] is False
+
+    # A reaction alone is enough, with no admin involved at all.
     assert guest.post(
-        f"/api/admin/photos/{photo_id}/pin", json={"pinned": True}, headers=ORIGIN
+        f"/api/photos/{loved}/reactions", json={"emoji": "❤️"}, headers=ORIGIN
+    ).status_code == 200
+    assert streamed()[loved]["hot"] is True
+    assert streamed()[quiet]["hot"] is False
+    assert hot_count() == 1
+
+    # A hand-picked photo is added to that, not swapped for it.
+    assert guest.post(
+        f"/api/admin/photos/{quiet}/hot", json={"hot": True}, headers=ORIGIN
     ).status_code == 403
+    assert admin.post(
+        f"/api/admin/photos/{quiet}/hot", json={"hot": True}, headers=ORIGIN
+    ).json() == {"id": quiet, "hot": True}
+    assert streamed()[quiet]["hot"] is True
+    assert hot_count() == 2
 
-    pinned = admin.post(
-        f"/api/admin/photos/{photo_id}/pin", json={"pinned": True}, headers=ORIGIN
-    )
-    assert pinned.status_code == 200
-    assert pinned.json() == {"id": photo_id, "pinned": True}
-    assert streamed()[photo_id]["pinned"] is True
-    assert guest.get("/api/photos").json()["photos"][0]["pinned"] is True
+    # A ruling also works against the reactions: this one is popular and stays out.
+    assert admin.post(
+        f"/api/admin/photos/{loved}/hot", json={"hot": False}, headers=ORIGIN
+    ).json() == {"id": loved, "hot": False}
+    assert streamed()[loved]["hot"] is False
+    assert hot_count() == 1
+    # Both rulings are still on record; nothing was overwritten.
+    assert len(store.list_prefix(f"pins/{loved}/")) == 1
 
-    # A comment has to reach the stream, because the screens rank on it.
-    guest.post(f"/api/photos/{photo_id}/comments", json={"text": "Schön!"}, headers=ORIGIN)
-    assert streamed()[photo_id]["comments"] == 1
+    # Searching for "hot" finds exactly the hot ones, for guests too.
+    found = guest.get("/api/photos", params={"q": "hot"}).json()["photos"]
+    assert [photo["id"] for photo in found] == [quiet]
+    assert found[0]["hot"] is True
+
+    # A photo taken off the wall is not hot on it, whatever it was ruled.
+    admin.post(f"/api/admin/photos/{quiet}/stream", json={"shown": False}, headers=ORIGIN)
+    assert quiet not in streamed()
+    assert guest.get("/api/photos", params={"q": "hot"}).json()["photos"] == []
+    admin.post(f"/api/admin/photos/{quiet}/stream", json={"shown": True}, headers=ORIGIN)
+    assert streamed()[quiet]["hot"] is True
 
     assert admin.post(
-        f"/api/admin/photos/{photo_id}/pin", json={"pinned": "ja"}, headers=ORIGIN
+        f"/api/admin/photos/{quiet}/hot", json={"hot": "ja"}, headers=ORIGIN
     ).status_code == 400
-
-    unpinned = admin.post(
-        f"/api/admin/photos/{photo_id}/pin", json={"pinned": False}, headers=ORIGIN
-    )
-    assert unpinned.json() == {"id": photo_id, "pinned": False}
-    assert streamed()[photo_id]["pinned"] is False
-
-    # Nothing was overwritten: both decisions are still on record, newest wins.
-    assert len(store.list_prefix(f"pins/{photo_id}/")) == 2
-
     assert admin.post(
-        f"/api/admin/photos/{photo_id}/pin", json={"pinned": True}, headers=ORIGIN
-    ).json()["pinned"] is True
-    admin.post(f"/api/admin/photos/{photo_id}/hide", headers=ORIGIN)
-    assert photo_id not in streamed()
-    assert admin.post(
-        f"/api/admin/photos/{photo_id}/pin", json={"pinned": True}, headers=ORIGIN
-    ).status_code == 409
-    assert admin.post(
-        f"/api/admin/photos/{uuid.uuid4()!s}/pin", json={"pinned": True}, headers=ORIGIN
+        f"/api/admin/photos/{uuid.uuid4()!s}/hot", json={"hot": True}, headers=ORIGIN
     ).status_code == 404
 
 
@@ -586,7 +598,7 @@ def test_admin_takes_a_photo_off_the_stream_but_keeps_it_in_the_gallery(tmp_path
     assert listed[photo_id]["in_stream"] is False
 
     # A hot photo that is off the wall stays off it.
-    admin.post(f"/api/admin/photos/{photo_id}/pin", json={"pinned": True}, headers=ORIGIN)
+    admin.post(f"/api/admin/photos/{photo_id}/hot", json={"hot": True}, headers=ORIGIN)
     assert on_wall() == []
 
     back = admin.post(
