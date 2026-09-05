@@ -48,5 +48,125 @@
     "id": "kleiner-moment",
     "text": "Fotografiere einen kleinen Moment, den sonst vielleicht niemand bemerkt.",
     "enabled": true
+  },
+  {
+    "id": "party-fc19eef8dd3742e0aa5c2c0c8b87fb7b",
+    "text": "Mach ein Foto mit einer Person, die eines der Geburtstagskinder schonmal nackt gesehen hat.",
+    "enabled": true
+  },
+  {
+    "id": "party-64a6976589ac4abcbfa559e6d53cef83",
+    "text": "Mach ein Foto mit einer Person, die die gleiche Sportart in der Kindheit gespielt hat.",
+    "enabled": true
+  },
+  {
+    "id": "party-4cd6951efc29430095aba0993e2059bd",
+    "text": "Mach ein Foto mit einer Person, die für das Foto trichtert.",
+    "enabled": true
+  },
+  {
+    "id": "party-166053f5b2f044599d4bd41ab06cf976",
+    "text": "Trink mit zwei weiteren Personen einen Shot und mach davon ein Foto.",
+    "enabled": true
+  },
+  {
+    "id": "party-4a2209434f154f22b5ac6111088bd313",
+    "text": "Mach ein Foto mit zwei weiteren Personen, die du vor heute noch nicht gekannt hast.",
+    "enabled": true
+  },
+  {
+    "id": "party-a09a75e155424955ae72eec0aea35d4a",
+    "text": "Mach ein Foto mit der Person, von der du denkst, dass sie am tagesvollsten sein wird.",
+    "enabled": true
+  },
+  {
+    "id": "party-0aa1d554a37d4f0b8a79fb3d4843bdd0",
+    "text": "Mach ein Foto mit einer Person, die im gleichen Bundesland geboren ist.",
+    "enabled": true
+  },
+  {
+    "id": "party-2cf1e7b615de452786442b55ac56780e",
+    "text": "Mach ein Foto mit einer Person, der du ein Küsschen auf die Wange gibst.",
+    "enabled": true
+  },
+  {
+    "id": "party-38416d5ba3084f4680ea0c5c2ad82eaa",
+    "text": "Mach ein Foto mit einer Person, die die gleiche Haarfarbe hat.",
+    "enabled": true
+  },
+  {
+    "id": "party-8029bdc40cb64f089ea760c9d3e2862a",
+    "text": "Mach ein Foto mit einer Person, die im gleichen Jahr geboren ist.",
+    "enabled": true
+  },
+  {
+    "id": "party-cbd54ce24e374eafa5d6d4fb4b12ac13",
+    "text": "Mach ein Foto mit einer Person, die den gleichen Anfangsbuchstaben im Vornamen hat.",
+    "enabled": true
+  },
+  {
+    "id": "party-2bbeb56f8784483785446acebb48fc7b",
+    "text": "Mach ein Foto mit 3 gleich großen Personen.",
+    "enabled": true
+  },
+  {
+    "id": "party-56be63f379da46c8b8a24d28c5afd377",
+    "text": "Mach ein Foto.",
+    "enabled": true
+  },
+  {
+    "id": "party-2d9a3c3b4ce240a88823d8fe9f3c97c5",
+    "text": "Tausche mit einer Person ein Kleidungsstück und mache dann ein Foto.",
+    "enabled": true
+  },
+  {
+    "id": "party-db600a7726474042a76ebb8092dddf1c",
+    "text": "Mach ein Foto mit der Person, die auch bei einem Stand von 6:1 Bechern noch im Beer-Pong verlieren würde.",
+    "enabled": true
+  },
+  {
+    "id": "party-5c1521ebfb3b4a4396a1796692e31be0",
+    "text": "Mach ein Foto mit der Person, von der du glaubst, dass sie die schönste Unterwäsche trägt.",
+    "enabled": true
+  },
+  {
+    "id": "party-a646a38d83c34a1f9bbf0ad1b9766a58",
+    "text": "Mach ein Foto mit der Person, die du heute am attraktivsten findest.",
+    "enabled": true
+  },
+  {
+    "id": "party-1240b70d13b9485abdfc530f145604c2",
+    "text": "Mach ein Foto mit der Person, bei der du glaubst, dass sie am ehesten verhaftet wird.",
+    "enabled": true
+  },
+  {
+    "id": "party-bd085a2fb0484697bd32f3c88ee45998",
+    "text": "Mach ein Foto mit deinem Lieblingsmenschen.",
+    "enabled": true
+  },
+  {
+    "id": "noch-total-fit",
+    "text": "Mach ein Foto mit einer Person, die gerade behauptet, sie sei „noch total fit“.",
+    "enabled": true
+  },
+  {
+    "id": "nackt-tanzen",
+    "text": "Mach ein Foto mit der Person, die am ehesten nackt tanzen würde, wenn die Musik stimmt.",
+    "enabled": true
+  },
+  {
+    "id": "morgen-nichts-wissen",
+    "text": "Mach ein Foto mit der Person, die am ehesten morgen nichts mehr davon wissen will.",
+    "enabled": true
+  },
+  {
+    "id": "letzten-shot-bereut",
+    "text": "Mach ein Foto mit einer Person, die gerade ihren letzten Shot bereut.",
+    "enabled": true
+  },
+  {
+    "id": "noch-losziehen",
+    "text": "Mach ein Foto mit der Person, die am ehesten noch um 4 Uhr morgens „Lass uns noch losziehen“ sagt.",
+    "enabled": true
   }
 ]

@@ -10,8 +10,8 @@
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="stylesheet" href="/static/style.css?v=hot-search-v10">
-  <script src="/static/app.js?v=hot-search-v10" type="module"></script>
+  <link rel="stylesheet" href="/static/style.css?v=offline-tasks-v13">
+  <script src="/static/app.js?v=offline-tasks-v13" type="module"></script>
 </head>
 <body>
   <div id="page-backdrop" class="page-backdrop" aria-hidden="true" hidden></div>
@@ -41,10 +41,11 @@
             <div><dt>Geräte-ID</dt><dd><code id="profile-device-id"></code></dd></div>
             <div class="profile-value"><dt>Hochgeladene Fotos</dt><dd id="profile-upload-count">0</dd></div>
           </dl>
-          <button id="task-add-open" class="secondary task-add-open" type="button">Aufgabe hinzufügen</button>
+          <button id="task-add-open" class="secondary task-add-open" type="button">Eigene Aufgabe hinzufügen</button>
           <form id="task-add-form" class="task-add-form" hidden>
-            <label for="task-add-input">Neue Foto-Aufgabe</label>
+            <label for="task-add-input">Eigene Foto-Aufgabe</label>
             <textarea id="task-add-input" maxlength="500" rows="3" placeholder="Zum Beispiel: Mach ein Foto mit deinem Lieblingsmenschen."></textarea>
+            <p class="hint">Nur du bekommst diese Aufgabe zur Auswahl. Admins können sie später veröffentlichen.</p>
             <p id="task-add-error" class="error" role="alert"></p>
             <p id="task-add-status" class="hint" role="status"></p>
             <div class="task-add-actions"><button id="task-add-submit" class="primary" type="submit">Aufgabe speichern</button><button id="task-add-cancel" class="text-button" type="button">Abbrechen</button></div>
@@ -74,6 +75,16 @@
       </form>
       <p class="footnote">Ohne Konto. Ohne Tracking. Nur eure Fotos.</p>
     </section>
+    <section id="blocked" class="blocked-page narrow" hidden aria-labelledby="blocked-title">
+      <img src="/static/blocked.jpg" width="538" height="484" alt="Ein sichtbar verärgerter Mann" decoding="async">
+      <div class="blocked-copy">
+        <p class="eyebrow">Zugang gesperrt</p>
+        <h1 id="blocked-title">Du wurdest aus dieser Party entfernt.</h1>
+        <p id="blocked-message" class="intro">Deine Geräte-ID ist gesperrt. Eine neue Beitrittsanfrage wurde an die Admins geschickt.</p>
+        <button id="blocked-retry" class="primary" type="button">Erneut prüfen</button>
+        <p id="blocked-status" class="hint" role="status"></p>
+      </div>
+    </section>
     <section id="profile-setup" class="narrow" hidden aria-labelledby="profile-setup-title">
       <p class="eyebrow">Dein Platz in der Galerie</p>
       <h1 id="profile-setup-title">Wie dürfen wir dich nennen?</h1>
@@ -94,21 +105,61 @@
       <section id="challenge" class="challenge" aria-label="Foto-Aufgabe">
         <button id="challenge-draw" class="challenge-trigger" type="button">
           <span class="challenge-kicker">Foto-Aufgabe</span>
-          <strong>Aufgabe ziehen</strong>
-          <span class="challenge-arrow" aria-hidden="true">→</span>
+          <strong>Aufgabe auswählen</strong>
+          <svg class="challenge-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
         </button>
-        <div id="challenge-panel" class="challenge-panel" hidden>
-          <h2 id="challenge-text" class="challenge-text" aria-live="polite"></h2>
-          <div class="actions challenge-actions">
-            <button id="challenge-camera" class="primary" type="button">Foto aufnehmen</button>
-            <button id="challenge-library" class="secondary" type="button">Bild auswählen</button>
+        <dialog id="challenge-panel" class="challenge-panel" aria-labelledby="challenge-title" aria-describedby="challenge-hint" hidden>
+          <div class="challenge-shell">
+            <header class="challenge-header">
+              <div>
+                <span class="challenge-kicker">Foto-Aufgabe</span>
+                <h2 id="challenge-title">Wähle eine Aufgabe</h2>
+                <p id="challenge-hint">Tippe eine Karte an, dann geht’s los.</p>
+              </div>
+              <div class="challenge-header-actions">
+                <button id="challenge-refresh" class="challenge-tool" type="button" aria-label="Vier neue Aufgaben anzeigen">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"/><path d="M18.4 15a7 7 0 1 1-.2-8.2L20 8.5"/></svg>
+                </button>
+                <button id="challenge-custom-open" class="challenge-tool" type="button" aria-label="Eigene Aufgabe schreiben" aria-controls="challenge-custom-form" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.2-1 10.9-10.9a2.2 2.2 0 0 0-3.2-3.2L5 15.8Z"/><path d="m14.8 6 3.2 3.2"/></svg>
+                </button>
+                <button id="challenge-cancel" class="challenge-tool challenge-close" type="button" aria-label="Aufgabenauswahl schließen">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+                </button>
+              </div>
+            </header>
+            <div class="challenge-content">
+              <div id="challenge-options" class="challenge-options" role="group" aria-label="Vier Foto-Aufgaben" aria-live="polite"></div>
+              <form id="challenge-custom-form" class="challenge-custom-form" hidden>
+                <div>
+                  <label for="challenge-custom-input">Deine eigene Aufgabe</label>
+                  <textarea id="challenge-custom-input" maxlength="500" rows="4" placeholder="Was möchtest du fotografieren?" required></textarea>
+                  <p class="challenge-custom-note">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+                    Nur für dich. Admins sehen den Ersteller und können die Aufgabe veröffentlichen.
+                  </p>
+                  <p id="challenge-custom-error" class="challenge-picker-error" role="alert"></p>
+                </div>
+                <div class="challenge-custom-actions">
+                  <button id="challenge-custom-submit" class="primary" type="submit">Übernehmen</button>
+                  <button id="challenge-custom-cancel" class="secondary" type="button">Zurück</button>
+                </div>
+              </form>
+            </div>
+            <p id="challenge-error" class="challenge-picker-error" role="alert"></p>
+            <div id="challenge-actions" class="challenge-actions">
+              <button id="challenge-camera" class="primary" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5 6.5 8H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-2.5L16 5Z"/><circle cx="12" cy="14" r="4"/></svg>
+                <span>Aufnehmen</span>
+              </button>
+              <button id="challenge-library" class="secondary" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9" r="1.5"/><path d="m4 17 4.5-4.5 3.5 3 2.5-2.5 5.5 5"/></svg>
+                <span>Hochladen</span>
+              </button>
+            </div>
+            <p id="challenge-selection-status" class="sr-only" role="status"></p>
           </div>
-          <div class="challenge-links">
-            <button id="challenge-again" class="text-button" type="button">Andere Aufgabe</button>
-            <button id="challenge-cancel" class="text-button" type="button">Ohne Aufgabe weiter</button>
-          </div>
-        </div>
-        <p id="challenge-error" class="error" role="alert"></p>
+        </dialog>
       </section>
       <div id="free-divider" class="choice-divider" aria-hidden="true"><span>oder frei fotografieren</span></div>
       <div id="pick-actions" class="actions">
@@ -167,9 +218,15 @@
     </section>
     <section id="admin" class="admin-page" hidden aria-labelledby="admin-title">
       <div class="admin-heading"><div><p class="eyebrow">Verwaltung</p><h1 id="admin-title">Party im Überblick.</h1><p id="admin-status" class="muted" role="status">Daten werden geladen …</p></div><button id="admin-back" class="secondary" type="button">← Zurück</button></div>
-      <div class="admin-tabs" role="tablist" aria-label="Admin-Bereiche"><button id="admin-users-tab" type="button" role="tab" aria-selected="true" aria-controls="admin-users-pane">Gäste</button><button id="admin-stream-tab" type="button" role="tab" aria-selected="false" aria-controls="admin-stream-pane">Stream</button><button id="admin-tasks-tab" type="button" role="tab" aria-selected="false" aria-controls="admin-tasks-pane">Aufgaben</button></div>
+      <div class="admin-tabs" role="tablist" aria-label="Admin-Bereiche"><button id="admin-users-tab" type="button" role="tab" aria-selected="true" aria-controls="admin-users-pane">Gäste</button><button id="admin-requests-tab" type="button" role="tab" aria-selected="false" aria-controls="admin-requests-pane">Anfragen <span id="admin-requests-count" class="admin-tab-count" hidden></span></button><button id="admin-stream-tab" type="button" role="tab" aria-selected="false" aria-controls="admin-stream-pane">Stream</button><button id="admin-tasks-tab" type="button" role="tab" aria-selected="false" aria-controls="admin-tasks-pane">Aufgaben</button></div>
       <p id="admin-error" class="error" role="alert"></p>
       <section id="admin-users-pane" role="tabpanel" aria-labelledby="admin-users-tab"><label class="admin-search" for="admin-search"><span>Gäste durchsuchen</span><input id="admin-search" type="search" autocomplete="off" placeholder="Name, Nutzer- oder Geräte-ID suchen" aria-describedby="admin-search-hint"><small id="admin-search-hint">Durchsucht alle registrierten Party-Gäste.</small></label><div id="admin-summary" class="admin-summary" hidden></div><div id="admin-users" class="admin-users"></div><p id="admin-empty" class="admin-empty" hidden>Keine passenden Gäste gefunden.</p></section>
+      <section id="admin-requests-pane" role="tabpanel" aria-labelledby="admin-requests-tab" hidden>
+        <p class="admin-pane-intro">Hier erscheinen gesperrte Gäste, sobald sie erneut versuchen, der Party beizutreten. Mit der Freigabe kann dieses Gerät sofort wieder hinein.</p>
+        <p id="admin-requests-status" class="muted" role="status"></p>
+        <div id="admin-requests" class="admin-requests"></div>
+        <div id="admin-requests-empty" class="admin-request-empty" hidden><strong>Keine offenen Anfragen</strong><p>Neue Beitrittsversuche von gesperrten Geräten erscheinen automatisch hier.</p></div>
+      </section>
       <section id="admin-stream-pane" role="tabpanel" aria-labelledby="admin-stream-tab" hidden>
         <p class="admin-pane-intro">Der Stream läuft von allein. Alle zehn Fotos schiebt er ein Hot-Foto dazwischen. Hot wird ein Foto, wenn die Party darauf reagiert hat — oder wenn ihr es anpinnt. Beides zählt gleich viel.</p>
         <div id="admin-stream-summary" class="admin-summary" hidden></div>

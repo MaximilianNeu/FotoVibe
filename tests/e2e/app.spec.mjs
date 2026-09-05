@@ -13,6 +13,24 @@ test('login surface fits the selected device viewport', async ({ page }) => {
   expect(viewportFits).toBe(true);
 });
 
+test('a blocked device sees the dedicated access page and can retry', async ({ page }) => {
+  await page.route('**/api/session**', async (route) => {
+    await route.fulfill({
+      status: 403,
+      contentType: 'application/json',
+      headers: { 'X-FotoVibe-Reason': 'party-blocked' },
+      body: JSON.stringify({ detail: 'Du wurdest aus dieser Party entfernt.' }),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Du wurdest aus dieser Party entfernt.' })).toBeVisible();
+  await expect(page.locator('#blocked img')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Erneut prüfen' })).toBeVisible();
+  await page.getByRole('button', { name: 'Erneut prüfen' }).click();
+  await expect(page.locator('#blocked-status')).toContainText('Noch nicht freigegeben');
+});
+
 test('a local developer can reach the camera entry point', async ({ page }) => {
   await page.goto('/');
   await page.getByLabel('Party-Code').fill('1234');
@@ -23,6 +41,236 @@ test('a local developer can reach the camera entry point', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Halte den Abend fest.' })).toBeVisible();
   await expect(page.getByRole('button', { name: /Foto aufnehmen/ }).first()).toBeVisible();
   await expect(page.locator('#local-cache')).toBeHidden();
+});
+
+test('the task picker presents four mobile-friendly choices and a clear exit', async ({ page }) => {
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    window.__personalTaskRequests = 0;
+    window.fetch = (input, options = {}) => {
+      const path = new URL(typeof input === 'string' ? input : input.url, location.href).pathname;
+      if (path !== '/api/tasks' || options.method !== 'POST') return nativeFetch(input, options);
+      window.__personalTaskRequests += 1;
+      return Promise.resolve(new Response(JSON.stringify({
+        id: 'party-playwright-private',
+        text: 'Mach ein Foto mit deinem Lieblingsmenschen.',
+        personal: true,
+        task_token: 'playwright-private-token',
+      }), { status: 201, headers: { 'Content-Type': 'application/json' } }));
+    };
+  });
+  await page.goto('/');
+  await page.getByLabel('Party-Code').fill('1234');
+  await page.getByRole('button', { name: /Dabei sein/ }).click();
+  await page.getByLabel('Dein Name').fill('Playwright Aufgaben');
+  await page.getByRole('button', { name: /Weiter zur Party/ }).click();
+
+  await page.getByRole('button', { name: 'Aufgabe auswählen' }).click();
+  const picker = page.getByRole('dialog', { name: 'Wähle eine Aufgabe' });
+  await expect(picker).toBeVisible();
+  await expect(page.locator('.challenge-option')).toHaveCount(4);
+  await expect(page.getByRole('button', { name: 'Aufnehmen' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Hochladen' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Vier neue Aufgaben anzeigen' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Eigene Aufgabe schreiben' })).toBeVisible();
+
+  const layout = await page.evaluate(() => {
+    const panel = document.getElementById('challenge-panel').getBoundingClientRect();
+    const camera = document.getElementById('challenge-camera').getBoundingClientRect();
+    const library = document.getElementById('challenge-library').getBoundingClientRect();
+    return {
+      panelWidth: panel.width,
+      panelHeight: panel.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      actionsShareRow: Math.abs(camera.top - library.top) < 2 && library.left > camera.left,
+      noHorizontalOverflow: document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+    };
+  });
+  expect(layout.panelWidth).toBeGreaterThanOrEqual(layout.viewportWidth - 1);
+  expect(layout.panelHeight).toBeGreaterThanOrEqual(layout.viewportHeight - 1);
+  expect(layout.actionsShareRow).toBe(true);
+  expect(layout.noHorizontalOverflow).toBe(true);
+
+  for (const viewport of [{ width: 320, height: 568 }, { width: 667, height: 375 }]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(() => new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
+    const compactLayout = await page.evaluate(() => {
+      const visibleRect = (id) => {
+        const rect = document.getElementById(id).getBoundingClientRect();
+        return {
+          height: rect.height,
+          width: rect.width,
+          inside: rect.left >= 0
+            && rect.top >= 0
+            && rect.right <= window.innerWidth + 1
+            && rect.bottom <= window.innerHeight + 1,
+        };
+      };
+      return {
+        refresh: visibleRect('challenge-refresh'),
+        custom: visibleRect('challenge-custom-open'),
+        close: visibleRect('challenge-cancel'),
+        camera: visibleRect('challenge-camera'),
+        library: visibleRect('challenge-library'),
+        noHorizontalOverflow: document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+      };
+    });
+    expect(compactLayout.noHorizontalOverflow).toBe(true);
+    for (const [name, control] of Object.entries(compactLayout).filter(([, value]) => typeof value === 'object')) {
+      expect(control.inside, `${name} must stay inside ${viewport.width}x${viewport.height}`).toBe(true);
+      expect(control.width).toBeGreaterThanOrEqual(44);
+      expect(control.height).toBeGreaterThanOrEqual(44);
+    }
+  }
+
+  const initialTaskIds = await page.locator('.challenge-option').evaluateAll(
+    (options) => options.map((option) => option.dataset.taskId),
+  );
+  await page.getByRole('button', { name: 'Vier neue Aufgaben anzeigen' }).click();
+  await expect(page.locator('.challenge-option')).toHaveCount(4);
+  await expect.poll(() => page.locator('.challenge-option').evaluateAll(
+    (options) => options.map((option) => option.dataset.taskId),
+  )).not.toEqual(initialTaskIds);
+
+  await page.getByRole('button', { name: 'Eigene Aufgabe schreiben' }).click();
+  await expect(page.locator('#challenge-custom-form')).toBeVisible();
+  await page.getByLabel('Deine eigene Aufgabe').fill('Mach ein Foto mit deinem Lieblingsmenschen.');
+  await page.getByRole('button', { name: 'Übernehmen' }).click();
+  await expect(page.locator('.challenge-option')).toHaveCount(4);
+  const personalTask = page.getByRole('button', {
+    name: 'Eigene Aufgabe: Mach ein Foto mit deinem Lieblingsmenschen.',
+  });
+  await expect(personalTask).toHaveAttribute('aria-pressed', 'true');
+  expect(await page.evaluate(() => window.__personalTaskRequests)).toBe(1);
+  await expect(page.getByRole('button', { name: 'Aufnehmen' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Hochladen' })).toBeEnabled();
+
+  await page.getByRole('button', { name: 'Aufgabenauswahl schließen' }).click();
+  await expect(picker).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Aufgabe auswählen' })).toBeVisible();
+});
+
+test('personal tasks and several four-task rounds survive offline reloads', async ({ page, context }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'Exercises the Service Worker and IndexedDB once in Chromium.');
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    const publicTasks = Array.from({ length: 16 }, (_, index) => ({
+      id: `cached-${String(index + 1).padStart(2, '0')}`,
+      text: `Offline-Aufgabe ${index + 1}`,
+      task_token: `cached-token-${index + 1}`,
+    }));
+    const syncedTasks = [];
+    window.__offlineTaskSyncs = 0;
+    window.__readTaskState = () => new Promise((resolve, reject) => {
+      const request = indexedDB.open('fotovibe-offline', 1);
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction('state', 'readonly');
+        const stateRequest = transaction.objectStore('state').get('tasks');
+        stateRequest.onsuccess = () => {
+          resolve(stateRequest.result?.value || null);
+          database.close();
+        };
+        stateRequest.onerror = () => reject(stateRequest.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    window.fetch = (input, options = {}) => {
+      const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+      const method = options.method || (typeof input === 'string' ? 'GET' : input.method);
+      if (url.pathname !== '/api/tasks') return nativeFetch(input, options);
+      if (method === 'GET') {
+        return Promise.resolve(new Response(JSON.stringify({ tasks: [...syncedTasks, ...publicTasks] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      if (method === 'POST' && navigator.onLine !== false) {
+        const payload = JSON.parse(options.body);
+        const task = {
+          id: payload.offline_id,
+          text: payload.text,
+          personal: true,
+          task_token: `synced-token-${payload.offline_id}`,
+        };
+        syncedTasks.splice(0, syncedTasks.length, task);
+        window.__offlineTaskSyncs += 1;
+        return Promise.resolve(new Response(JSON.stringify(task), {
+          status: 201,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      return nativeFetch(input, options);
+    };
+  });
+
+  await page.goto('/');
+  await page.getByLabel('Party-Code').fill('1234');
+  await page.getByRole('button', { name: /Dabei sein/ }).click();
+  await page.getByLabel('Dein Name').fill('Playwright Offline Tasks');
+  await page.getByRole('button', { name: /Weiter zur Party/ }).click();
+  await expect.poll(() => page.evaluate(async () => (await window.__readTaskState())?.tasks?.length || 0)).toBe(16);
+  await page.waitForFunction(() => navigator.serviceWorker?.controller);
+
+  await context.setOffline(true);
+  await page.evaluate(() => window.dispatchEvent(new Event('offline')));
+  await page.getByRole('button', { name: 'Aufgabe auswählen' }).click();
+  const firstCycle = new Set();
+  for (let round = 0; round < 4; round++) {
+    const ids = await page.locator('.challenge-option').evaluateAll(
+      (options) => options.map((option) => option.dataset.taskId),
+    );
+    ids.forEach((id) => firstCycle.add(id));
+    if (round < 3) await page.getByRole('button', { name: 'Vier neue Aufgaben anzeigen' }).click();
+  }
+  expect(firstCycle.size).toBe(16);
+
+  await page.getByRole('button', { name: 'Eigene Aufgabe schreiben' }).click();
+  await page.getByLabel('Deine eigene Aufgabe').fill('Mein persönliches Offline-Motiv');
+  await page.getByRole('button', { name: 'Übernehmen' }).click();
+  const localTask = page.getByRole('button', { name: 'Eigene Offline-Aufgabe: Mein persönliches Offline-Motiv' });
+  await expect(localTask).toHaveAttribute('aria-pressed', 'true');
+  await expect(localTask.locator('.challenge-option-number')).toHaveText('LOKAL');
+  const offlineTaskId = await localTask.getAttribute('data-task-id');
+  expect(offlineTaskId).toMatch(/^offline-/);
+
+  await page.getByRole('button', { name: 'Aufgabenauswahl schließen' }).click();
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Halte den Abend fest.' })).toBeVisible();
+  const restored = await page.evaluate(async (id) => {
+    const state = await window.__readTaskState();
+    return state.tasks.find((task) => task.id === id);
+  }, offlineTaskId);
+  expect(restored).toMatchObject({
+    id: offlineTaskId,
+    text: 'Mein persönliches Offline-Motiv',
+    personal: true,
+    pending_sync: true,
+  });
+
+  await page.getByRole('button', { name: 'Aufgabe auswählen' }).click();
+  const restoredCycle = new Set();
+  for (let round = 0; round < 5; round++) {
+    const ids = await page.locator('.challenge-option').evaluateAll(
+      (options) => options.map((option) => option.dataset.taskId),
+    );
+    ids.forEach((id) => restoredCycle.add(id));
+    if (round < 4) await page.getByRole('button', { name: 'Vier neue Aufgaben anzeigen' }).click();
+  }
+  expect(restoredCycle.size).toBe(17);
+  expect(restoredCycle.has(offlineTaskId)).toBe(true);
+
+  await context.setOffline(false);
+  await page.evaluate(() => window.dispatchEvent(new Event('online')));
+  await expect.poll(() => page.evaluate(async (id) => {
+    const state = await window.__readTaskState();
+    const task = state.tasks.find((candidate) => candidate.id === id);
+    return Boolean(task?.task_token && !task.pending_sync);
+  }, offlineTaskId)).toBe(true);
+  expect(await page.evaluate(() => window.__offlineTaskSyncs)).toBe(1);
 });
 
 test('the gallery keeps search collapsed and offers a personal quick filter', async ({ page }) => {
@@ -69,8 +317,11 @@ test('an offline photo survives reload and uploads when the connection returns',
   await page.getByLabel('Dein Name').fill('Playwright Offline Queue');
   await page.getByRole('button', { name: /Weiter zur Party/ }).click();
   await expect(page.getByRole('heading', { name: 'Halte den Abend fest.' })).toBeVisible();
-  await page.getByRole('button', { name: 'Aufgabe ziehen' }).click();
-  await expect(page.getByRole('button', { name: /Foto aufnehmen/ }).first()).toBeVisible();
+  await page.getByRole('button', { name: 'Aufgabe auswählen' }).click();
+  await expect(page.locator('.challenge-option')).toHaveCount(4);
+  await expect(page.getByRole('button', { name: 'Aufnehmen' })).toBeDisabled();
+  await page.locator('.challenge-option').first().click();
+  await expect(page.getByRole('button', { name: 'Aufnehmen' })).toBeEnabled();
   await page.waitForFunction(() => navigator.serviceWorker?.controller);
   await page.waitForTimeout(250);
 
@@ -108,8 +359,10 @@ test('an offline photo survives reload and uploads when the connection returns',
 
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Halte den Abend fest.' })).toBeVisible();
-  await page.getByRole('button', { name: 'Aufgabe ziehen' }).click();
-  await expect(page.getByRole('button', { name: 'Foto aufnehmen' }).first()).toBeVisible();
+  await page.getByRole('button', { name: 'Aufgabe auswählen' }).click();
+  await expect(page.locator('.challenge-option')).toHaveCount(4);
+  await page.locator('.challenge-option').first().click();
+  await expect(page.getByRole('button', { name: 'Aufnehmen' })).toBeEnabled();
 
   await context.setOffline(false);
   await page.evaluate(() => window.dispatchEvent(new Event('online')));

@@ -8,9 +8,17 @@ About 100 party guests using iOS Safari or Android Chrome on their phones, often
 with one hand and on variable Wi-Fi. The host retains the original memories.
 
 ## Product Purpose
-Optionally draw a small photo task, then take or select a photo, review it locally,
+Optionally choose from four photo tasks or write a personal task, then take or select a photo, review it locally,
 explicitly share it, and browse the party's shared gallery. A shared code replaces
 individual accounts.
+
+Personal tasks are visible in the draw only to their creator. Admins can see who
+created them and may promote them into the public task pool.
+
+The complete available task pool is cached on the guest's device. Four-task
+rounds use a persistent shuffled deck, so offline reloads keep offering new
+choices until the cache is exhausted. Personal tasks can be created offline and
+are synchronized to the private server pool before related photos are uploaded.
 
 If a guest uses a photo task, the selected wording is saved with the photo and
 shown in the gallery. This association is historical: later task edits do not

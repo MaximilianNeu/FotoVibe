@@ -16,6 +16,7 @@ from pillow_heif import register_heif_opener
 import fotovibe.app as app_module
 from fotovibe.app import COOKIE, Settings, create_app
 from fotovibe.storage import LocalStore
+from fotovibe.tasks import LocalTaskStore
 
 register_heif_opener()
 ORIGIN = {"Origin": "https://testserver"}
@@ -25,34 +26,102 @@ class TestTaskStore:
     __test__ = False
 
     def __init__(self, tasks):
-        self.tasks = tasks
+        self.tasks = [
+            {"enabled": True, "is_public": True, **task}
+            for task in tasks
+        ]
 
     def enabled(self):
-        return self.tasks
+        return [
+            {"id": task["id"], "text": task["text"]}
+            for task in self.tasks
+            if task["enabled"] and task.get("is_public", True)
+        ]
 
-
-class MutableTestTaskStore:
-    def __init__(self, tasks=()):
-        self.tasks = [dict(task) for task in tasks]
-
-    def enabled(self):
-        return [{"id": task["id"], "text": task["text"]} for task in self.tasks if task["enabled"]]
+    def available(self, device=None):
+        return [
+            dict(task)
+            for task in self.tasks
+            if task["enabled"]
+            and (task.get("is_public", True) or task.get("created_by_device") == device)
+        ]
 
     def all(self):
         return [dict(task) for task in self.tasks]
 
-    def create(self, text):
-        task = {"id": f"party-{len(self.tasks) + 1}", "text": text.strip(), "enabled": True}
+
+class MutableTestTaskStore:
+    def __init__(self, tasks=()):
+        self.tasks = [
+            {"is_public": True, **task}
+            for task in tasks
+        ]
+
+    def enabled(self):
+        return [
+            {"id": task["id"], "text": task["text"]}
+            for task in self.tasks
+            if task["enabled"] and task.get("is_public", True)
+        ]
+
+    def available(self, device=None):
+        return [
+            dict(task)
+            for task in self.tasks
+            if task["enabled"]
+            and (task.get("is_public", True) or task.get("created_by_device") == device)
+        ]
+
+    def all(self):
+        return [dict(task) for task in self.tasks]
+
+    def create(self, text, *, is_public=True, created_by=None):
+        task = {
+            "id": f"party-{len(self.tasks) + 1}",
+            "text": text.strip(),
+            "enabled": True,
+            "is_public": is_public,
+        }
+        if created_by:
+            task.update(
+                created_by_device=created_by["device"],
+                created_by_user_id=created_by["user_id"],
+                created_by_name=created_by["name"],
+            )
         self.tasks.append(task)
         return dict(task)
 
-    def upsert(self, task_id, text, enabled=True):
+    def upsert(self, task_id, text, enabled=True, *, is_public=True, created_by=None):
         for index, task in enumerate(self.tasks):
             if task["id"] == task_id:
-                updated = {"id": task_id, "text": text.strip(), "enabled": enabled}
+                updated = {
+                    "id": task_id,
+                    "text": text.strip(),
+                    "enabled": enabled,
+                    "is_public": is_public,
+                }
+                if created_by:
+                    updated.update(
+                        created_by_device=created_by["device"],
+                        created_by_user_id=created_by["user_id"],
+                        created_by_name=created_by["name"],
+                    )
                 self.tasks[index] = updated
                 return dict(updated)
-        raise ValueError("missing")
+        created = {
+            "id": task_id,
+            "text": text.strip(),
+            "enabled": enabled,
+            "is_public": is_public,
+        }
+        if created_by:
+            created.update(
+                created_by_device=created_by["device"],
+                created_by_user_id=created_by["user_id"],
+                created_by_name=created_by["name"],
+            )
+        self.tasks.append(created)
+        return dict(created)
 
     def delete(self, task_id):
         before = len(self.tasks)
@@ -475,6 +544,92 @@ def test_admin_can_hide_photos_and_review_every_registered_user(tmp_path):
     assert hidden_user["photos"][0]["hidden"] is True
 
 
+def test_admin_can_block_a_device_and_approve_its_join_request(tmp_path):
+    store = LocalStore(tmp_path)
+    admin_device = str(uuid.uuid4())
+    guest_device = str(uuid.uuid4())
+    epoch = hashlib.sha256(b"TESTCODE").hexdigest()
+    admin_key = hashlib.sha256(f"{epoch}:{admin_device}".encode()).hexdigest()
+    app = create_app(
+        Settings(
+            "TEST-CODE",
+            "test-signing-key",
+            True,
+            (),
+            ("d_" + admin_key[:12],),
+        ),
+        store,
+    )
+    admin = TestClient(app, base_url="https://testserver")
+    guest = TestClient(app, base_url="https://testserver")
+
+    login_device(admin, admin_device)
+    admin_user = admin.post("/api/users/me", json={"name": "Alex"}, headers=ORIGIN).json()[
+        "user"
+    ]
+    login_device(guest, guest_device)
+    guest_user = guest.post("/api/users/me", json={"name": "Bea"}, headers=ORIGIN).json()[
+        "user"
+    ]
+
+    assert admin.patch(
+        f"/api/admin/users/{admin_user['device_id']}/access",
+        json={"blocked": True},
+        headers=ORIGIN,
+    ).status_code == 400
+
+    blocked = admin.patch(
+        f"/api/admin/users/{guest_user['device_id']}/access",
+        json={"blocked": True},
+        headers=ORIGIN,
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["user"]["blocked"] is True
+    assert len(store.list_prefix("access_events/")) == 1
+
+    rejected = guest.get("/api/session")
+    assert rejected.status_code == 403
+    assert rejected.headers["X-FotoVibe-Reason"] == "party-blocked"
+    assert rejected.json() == {"detail": "Du wurdest aus dieser Party entfernt."}
+    assert guest.get("/api/photos").status_code == 403
+    assert guest.post(
+        "/api/session/restore",
+        json={"device_id": guest_device},
+        headers=ORIGIN,
+    ).status_code == 403
+
+    overview = admin.get("/api/admin/overview").json()
+    assert overview["values"]["blocked"] == 1
+    assert overview["values"]["join_requests"] == 1
+    assert overview["join_requests"] == [
+        {
+            "user_id": guest_user["id"],
+            "name": "Bea",
+            "device_id": guest_user["device_id"],
+            "requested_at": overview["join_requests"][0]["requested_at"],
+            "attempts": 1,
+        }
+    ]
+
+    allowed = admin.patch(
+        f"/api/admin/users/{guest_user['device_id']}/access",
+        json={"blocked": False},
+        headers=ORIGIN,
+    )
+    assert allowed.status_code == 200
+    assert allowed.json()["user"]["blocked"] is False
+    assert len(store.list_prefix("access_events/")) == 2
+    assert admin.get("/api/admin/overview").json()["join_requests"] == []
+
+    restored = guest.post(
+        "/api/session/restore",
+        json={"device_id": guest_device},
+        headers=ORIGIN,
+    )
+    assert restored.status_code == 200
+    assert restored.json()["user"]["name"] == "Bea"
+
+
 def test_hot_comes_from_reactions_and_from_admin_rulings_together(tmp_path):
     store = LocalStore(tmp_path)
     admin_device = str(uuid.uuid4())
@@ -639,12 +794,20 @@ def test_users_can_add_tasks_and_admins_can_manage_them(tmp_path):
 
     created = guest.post("/api/tasks", json={"text": "  Ein Gruppenfoto mit Lachen  "}, headers=ORIGIN)
     assert created.status_code == 201
-    task_id = created.json()["id"]
-    assert created.json() == {
+    created_task = created.json()
+    task_id = created_task["id"]
+    assert created_task == {
         "id": task_id,
         "text": "Ein Gruppenfoto mit Lachen",
-        "enabled": True,
+        "personal": True,
+        "task_token": created_task["task_token"],
     }
+    assert isinstance(created_task["task_token"], str)
+    assert task_id in {task["id"] for task in guest.get("/api/tasks").json()["tasks"]}
+    assert task_id not in {task["id"] for task in admin.get("/api/tasks").json()["tasks"]}
+    assert upload(admin, task_id=task_id).status_code == 400
+    assert upload(admin, task_token=created_task["task_token"]).status_code == 400
+    assert upload(guest, task_id=task_id).status_code == 201
     assert guest.post("/api/tasks", json={"text": "   "}, headers=ORIGIN).status_code == 400
     assert guest.get("/api/admin/tasks").status_code == 403
     assert guest.patch(f"/api/admin/tasks/{task_id}", json={"text": "Nein"}, headers=ORIGIN).status_code == 403
@@ -653,6 +816,20 @@ def test_users_can_add_tasks_and_admins_can_manage_them(tmp_path):
     listed = admin.get("/api/admin/tasks")
     assert listed.status_code == 200
     assert {task["id"] for task in listed.json()["tasks"]} == {"bestehend", task_id}
+    private_task = next(task for task in listed.json()["tasks"] if task["id"] == task_id)
+    assert private_task == {
+        "id": task_id,
+        "text": "Ein Gruppenfoto mit Lachen",
+        "enabled": True,
+        "is_public": False,
+        "created_by": {
+            "id": private_task["created_by"]["id"],
+            "name": "Bea",
+            "device_id": private_task["created_by"]["device_id"],
+        },
+    }
+    assert private_task["created_by"]["id"].startswith("u_")
+    assert private_task["created_by"]["device_id"].startswith("d_")
     updated = admin.patch(
         f"/api/admin/tasks/{task_id}",
         json={"text": "Ein Gruppenfoto mit lautem Lachen"},
@@ -660,8 +837,93 @@ def test_users_can_add_tasks_and_admins_can_manage_them(tmp_path):
     )
     assert updated.status_code == 200
     assert updated.json()["text"] == "Ein Gruppenfoto mit lautem Lachen"
+    assert updated.json()["is_public"] is False
+    promoted = admin.post(f"/api/admin/tasks/{task_id}/publish", headers=ORIGIN)
+    assert promoted.status_code == 200
+    assert promoted.json()["is_public"] is True
+    assert promoted.json()["created_by"]["name"] == "Bea"
+    assert task_id in {task["id"] for task in admin.get("/api/tasks").json()["tasks"]}
     assert admin.delete("/api/admin/tasks/bestehend", headers=ORIGIN).status_code == 204
-    assert admin.get("/api/admin/tasks").json()["tasks"] == [updated.json()]
+    assert admin.get("/api/admin/tasks").json()["tasks"] == [promoted.json()]
+
+
+def test_offline_personal_task_sync_is_idempotent_and_owner_bound(tmp_path):
+    store = LocalStore(tmp_path)
+    tasks = MutableTestTaskStore()
+    app = create_app(Settings("TEST-CODE", "test-signing-key", True), store, tasks)
+    owner = TestClient(app, base_url="https://testserver")
+    stranger = TestClient(app, base_url="https://testserver")
+    login_device(owner, str(uuid.uuid4()))
+    login_device(stranger, str(uuid.uuid4()))
+    assert owner.post("/api/users/me", json={"name": "Bea"}, headers=ORIGIN).status_code == 200
+    assert stranger.post("/api/users/me", json={"name": "Chris"}, headers=ORIGIN).status_code == 200
+    offline_id = f"offline-{uuid.uuid4()}"
+
+    first = owner.post(
+        "/api/tasks",
+        json={"text": "Mein Offline-Motiv", "offline_id": offline_id},
+        headers=ORIGIN,
+    )
+    repeated = owner.post(
+        "/api/tasks",
+        json={"text": "Darf beim Retry nicht überschrieben werden", "offline_id": offline_id},
+        headers=ORIGIN,
+    )
+
+    assert first.status_code == repeated.status_code == 201
+    assert first.json()["id"] == repeated.json()["id"] == offline_id
+    assert repeated.json()["text"] == "Mein Offline-Motiv"
+    assert repeated.json()["personal"] is True
+    assert len([task for task in tasks.all() if task["id"] == offline_id]) == 1
+    assert owner.post(
+        "/api/photos",
+        content=picture(),
+        headers={**ORIGIN, "Content-Type": "image/jpeg", "X-FotoVibe-Task-Token": first.json()["task_token"]},
+    ).status_code == 201
+    assert stranger.post(
+        "/api/tasks",
+        json={"text": "Fremde Aufgabe", "offline_id": offline_id},
+        headers=ORIGIN,
+    ).status_code == 409
+    assert offline_id not in {task["id"] for task in stranger.get("/api/tasks").json()["tasks"]}
+
+
+def test_local_task_store_keeps_personal_tasks_owner_scoped_until_published(tmp_path):
+    path = tmp_path / "tasks.json"
+    path.write_text(
+        json.dumps([{"id": "public", "text": "Öffentlich", "enabled": True}])
+    )
+    tasks = LocalTaskStore(path)
+    owner_device = "a" * 64
+    creator = {
+        "device": owner_device,
+        "user_id": "u_" + "b" * 16,
+        "name": "Bea",
+    }
+
+    personal = tasks.create("Nur für Bea", is_public=False, created_by=creator)
+
+    assert {task["id"] for task in tasks.available(owner_device)} == {
+        "public",
+        personal["id"],
+    }
+    assert [task["id"] for task in tasks.available("c" * 64)] == ["public"]
+    assert [task["id"] for task in tasks.enabled()] == ["public"]
+
+    tasks.upsert(
+        personal["id"],
+        personal["text"],
+        personal["enabled"],
+        is_public=True,
+        created_by=creator,
+    )
+
+    assert {task["id"] for task in tasks.available("c" * 64)} == {
+        "public",
+        personal["id"],
+    }
+    promoted = next(task for task in tasks.all() if task["id"] == personal["id"])
+    assert promoted["created_by_name"] == "Bea"
 
 
 @pytest.mark.parametrize("fmt", ["JPEG", "PNG", "WEBP", "HEIF"])
@@ -1064,7 +1326,7 @@ def test_upload_rejects_unknown_task_without_publishing(env):
 
     assert response.status_code == 400
     assert response.json()["detail"] == (
-        "Diese Foto-Aufgabe ist nicht mehr verfügbar. Bitte neu ziehen."
+        "Diese Foto-Aufgabe ist nicht mehr verfügbar. Bitte neu auswählen."
     )
     assert not store.published()
 

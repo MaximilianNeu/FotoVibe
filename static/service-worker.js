@@ -1,12 +1,13 @@
-const CACHE = 'fotovibe-shell-v10';
+const CACHE = 'fotovibe-shell-v13';
 const SHELL = [
   '/',
   '/static/index.html',
-  '/static/style.css?v=hot-search-v10',
-  '/static/app.js?v=hot-search-v10',
+  '/static/style.css?v=offline-tasks-v13',
+  '/static/app.js?v=offline-tasks-v13',
   '/static/offline-store.js',
   '/static/vendor/heic-to.js',
   '/static/party.jpg',
+  '/static/blocked.jpg',
   '/static/favicon.svg',
   '/static/icon-192.png',
   '/static/icon-512.png',
@@ -94,6 +95,42 @@ async function stateValue(key) {
   const record = await requestValue(transaction.objectStore('state').get(key));
   await transactionDone(transaction);
   return record?.value;
+}
+
+async function setStateValue(key, value) {
+  const database = await openDatabase();
+  const transaction = database.transaction('state', 'readwrite');
+  transaction.objectStore('state').put({ key, value });
+  await transactionDone(transaction);
+}
+
+async function syncPendingPersonalTasks() {
+  const taskState = await stateValue('tasks');
+  const pending = Array.isArray(taskState?.tasks)
+    ? taskState.tasks.filter((task) => task?.pending_sync && task?.id && task?.text)
+    : [];
+  for (const task of pending) {
+    const response = await fetch('/api/tasks', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: task.text, offline_id: task.id }),
+    });
+    if (!response.ok) return false;
+    const synced = await response.json();
+    if (!synced?.id || !synced?.text || !synced?.task_token) return false;
+    for (const entry of await listEntries()) {
+      if (entry.task?.id !== task.id) continue;
+      await updateEntry(entry.id, {
+        task: { id: synced.id, text: synced.text, task_token: synced.task_token },
+        clientMetadata: { ...entry.clientMetadata, task_id: synced.id },
+      });
+    }
+    taskState.tasks = taskState.tasks.map((candidate) => candidate.id === task.id ? synced : candidate);
+    taskState.fetchedAt = Date.now();
+    await setStateValue('tasks', taskState);
+  }
+  return true;
 }
 
 async function updateEntry(id, patch) {
@@ -250,8 +287,10 @@ async function drainOutbox() {
   if (!(await acquireLease(owner))) return;
   const leaseRenewal = setInterval(() => { void acquireLease(owner); }, 10_000);
   try {
+    await syncPendingPersonalTasks();
     const entries = (await listEntries()).filter(
       (entry) => ['queued', 'uploading'].includes(entry.status)
+        && !entry.task?.pending_sync
         && (entry.nextAttemptAt || 0) <= Date.now(),
     );
     for (let index = 0; index < entries.length; index += UPLOAD_CONCURRENCY) {

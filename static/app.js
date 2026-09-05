@@ -22,6 +22,8 @@ const OUTBOX_MAX_ITEMS = 25;
 const OUTBOX_MAX_BYTES = 250 * 1024 * 1024;
 const OUTBOX_HEADROOM_BYTES = 20 * 1024 * 1024;
 const OUTBOX_UPLOAD_CONCURRENCY = 2;
+const MAX_PENDING_PERSONAL_TASKS = 10;
+const OFFLINE_TASK_ID_PATTERN = /^offline-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 let cachedDeviceId = null;
 let authenticated = false;
 let currentUser = null;
@@ -65,8 +67,11 @@ let selectedTask = null;
 let selectedUploadMetadata = null;
 let currentTask = null;
 let taskBusy = false;
+let challengeOptions = [];
 let cachedTasks = [];
 let taskBag = [];
+let taskCycleSeen = [];
+let taskSyncPromise = null;
 let lastDrawnTaskId = null;
 let outboxEntries = [];
 let queueSyncing = false;
@@ -654,7 +659,7 @@ async function requestBackgroundSync() {
 }
 
 function scheduleQueueSync() {
-  void syncOutbox();
+  void syncPendingPersonalTasks().then(() => syncOutbox());
   void requestBackgroundSync();
 }
 
@@ -670,7 +675,9 @@ async function syncOutbox() {
   const leaseRenewal = setInterval(() => { void acquireUploadLease(queueOwner); }, 10_000);
   try {
     const entries = (await listOutbox()).filter(
-      (entry) => entry.status === 'queued' && (entry.nextAttemptAt || 0) <= Date.now(),
+      (entry) => entry.status === 'queued'
+        && !entry.task?.pending_sync
+        && (entry.nextAttemptAt || 0) <= Date.now(),
     );
     for (let index = 0; index < entries.length; index += OUTBOX_UPLOAD_CONCURRENCY) {
       const batch = entries.slice(index, index + OUTBOX_UPLOAD_CONCURRENCY);
@@ -834,9 +841,26 @@ function showLogin(message = '') {
   closeProfileMenu();
   clearTimeout(timer);
   $('login').hidden = false;
-  $('profile-setup').hidden = $('upload').hidden = $('gallery').hidden = $('stream').hidden = $('admin').hidden = $('logout').hidden = $('boot').hidden = true;
+  $('blocked').hidden = $('profile-setup').hidden = $('upload').hidden = $('gallery').hidden = $('stream').hidden = $('admin').hidden = $('logout').hidden = $('boot').hidden = true;
   $('login-error').textContent = message;
   $('party-code').focus();
+}
+
+function showBlocked(message = 'Du wurdest aus dieser Party entfernt.') {
+  stopCamera(false);
+  closeChallengePicker(false);
+  document.body.classList.remove('review-open');
+  $('review').hidden = true;
+  stopStream();
+  authenticated = false;
+  showUser(null);
+  closeProfileMenu();
+  clearTimeout(timer);
+  $('blocked').hidden = false;
+  $('login').hidden = $('profile-setup').hidden = $('upload').hidden = $('gallery').hidden = $('stream').hidden = $('admin').hidden = $('logout').hidden = $('boot').hidden = true;
+  $('blocked-message').textContent = 'Deine Geräte-ID ist gesperrt. Eine Beitrittsanfrage wurde an die Admins geschickt.';
+  $('blocked-status').textContent = '';
+  $('blocked-retry').focus();
 }
 
 async function api(path, options = {}) {
@@ -853,6 +877,8 @@ async function api(path, options = {}) {
     if (response.status === 401 && authenticated) showLogin('Dein Zugang ist abgelaufen. Bitte den Party-Code erneut eingeben.');
     const error = new Error(message);
     error.status = response.status;
+    error.blocked = response.headers.get('X-FotoVibe-Reason') === 'party-blocked';
+    if (error.blocked) showBlocked(message);
     throw error;
   }
   return response.status === 204 ? null : response.json();
@@ -860,8 +886,11 @@ async function api(path, options = {}) {
 
 async function refreshTaskCache() {
   const result = await api('/api/tasks');
-  cachedTasks = Array.isArray(result.tasks) ? result.tasks.filter((task) => task?.id && task?.text && task?.task_token) : [];
-  taskBag = [];
+  const pending = cachedTasks.filter((task) => validCachedTask(task) && task.pending_sync);
+  const serverTasks = Array.isArray(result.tasks) ? result.tasks.filter(validCachedTask) : [];
+  const serverIds = new Set(serverTasks.map((task) => task.id));
+  cachedTasks = [...pending.filter((task) => !serverIds.has(task.id)), ...serverTasks];
+  reconcileTaskCycle();
   lastDrawnTaskId = cachedTasks.some((task) => task.id === lastDrawnTaskId) ? lastDrawnTaskId : null;
   await persistTaskState();
   return cachedTasks;
@@ -871,26 +900,173 @@ async function persistTaskState() {
   await setOfflineState('tasks', {
     tasks: cachedTasks,
     bag: taskBag,
+    seen: taskCycleSeen,
     lastDrawnTaskId,
     fetchedAt: Date.now(),
   });
 }
 
-function nextCachedTask(previousId = lastDrawnTaskId) {
-  const available = cachedTasks.filter((task) => task.id !== previousId);
-  if (!available.length) return cachedTasks[0] || null;
-  if (!taskBag.length || !taskBag.some((id) => available.some((task) => task.id === id))) {
-    taskBag = available.map((task) => task.id);
-    for (let index = taskBag.length - 1; index > 0; index--) {
-      const swap = Math.floor(Math.random() * (index + 1));
-      [taskBag[index], taskBag[swap]] = [taskBag[swap], taskBag[index]];
+function validCachedTask(task) {
+  return Boolean(
+    task?.id
+      && task?.text
+      && (task.task_token || (
+        task.personal === true
+        && task.pending_sync === true
+        && OFFLINE_TASK_ID_PATTERN.test(task.id)
+      )),
+  );
+}
+
+function shuffled(values) {
+  const result = [...values];
+  for (let index = result.length - 1; index > 0; index--) {
+    const swap = Math.floor(Math.random() * (index + 1));
+    [result[index], result[swap]] = [result[swap], result[index]];
+  }
+  return result;
+}
+
+function reconcileTaskCycle() {
+  const validIds = new Set(cachedTasks.map((task) => task.id));
+  taskCycleSeen = [...new Set(taskCycleSeen)].filter((id) => validIds.has(id));
+  const seen = new Set(taskCycleSeen);
+  taskBag = [...new Set(taskBag)].filter((id) => validIds.has(id) && !seen.has(id));
+  const accountedFor = new Set([...taskBag, ...taskCycleSeen]);
+  taskBag.push(...shuffled([...validIds].filter((id) => !accountedFor.has(id))));
+}
+
+function nextCachedTasks(count = 4, previousIds = []) {
+  reconcileTaskCycle();
+  const previous = new Set(previousIds);
+  const tasksById = new Map(cachedTasks.map((task) => [task.id, task]));
+  const tasks = [];
+  const target = Math.min(count, cachedTasks.length);
+  while (tasks.length < target) {
+    const selected = new Set(tasks.map((task) => task.id));
+    let candidateIndex = taskBag.findIndex((id) => !selected.has(id) && !previous.has(id));
+    if (candidateIndex < 0) {
+      let refill = [...tasksById.keys()].filter((id) => !selected.has(id) && !previous.has(id));
+      if (!refill.length) refill = [...tasksById.keys()].filter((id) => !selected.has(id));
+      if (!refill.length) break;
+      taskBag = shuffled(refill);
+      taskCycleSeen = [];
+      candidateIndex = 0;
+    }
+    const [id] = taskBag.splice(candidateIndex, 1);
+    const task = tasksById.get(id);
+    if (!task || selected.has(id)) continue;
+    tasks.push(task);
+    taskCycleSeen.push(id);
+  }
+  lastDrawnTaskId = tasks.at(-1)?.id || lastDrawnTaskId;
+  void persistTaskState().catch(() => {});
+  return tasks;
+}
+
+function normalizedPersonalTaskText(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text || text.length > 500) throw new Error('Eine Aufgabe muss zwischen 1 und 500 Zeichen lang sein.');
+  return text;
+}
+
+function taskForUpload(task) {
+  if (!task?.id || !task?.text) return null;
+  return {
+    id: task.id,
+    text: task.text,
+    ...(task.task_token ? { task_token: task.task_token } : {}),
+    ...(task.pending_sync ? { pending_sync: true } : {}),
+  };
+}
+
+async function cachePersonalTask(task, { markSeen = false } = {}) {
+  cachedTasks = [task, ...cachedTasks.filter((candidate) => candidate.id !== task.id)];
+  taskBag = taskBag.filter((id) => id !== task.id);
+  taskCycleSeen = taskCycleSeen.filter((id) => id !== task.id);
+  if (markSeen) taskCycleSeen.push(task.id);
+  else taskBag.unshift(task.id);
+  await persistTaskState();
+  return task;
+}
+
+async function createPersonalTask(value, options = {}) {
+  const text = normalizedPersonalTaskText(value);
+  const draft = {
+    id: `offline-${crypto.randomUUID()}`,
+    text,
+    personal: true,
+    pending_sync: true,
+    created_at: Date.now(),
+  };
+  if (!offlineMode && navigator.onLine !== false) {
+    try {
+      const task = await api('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, offline_id: draft.id }),
+      });
+      return cachePersonalTask(task, options);
+    } catch (error) {
+      if (!error.network) throw error;
     }
   }
-  const id = taskBag.shift();
-  const task = available.find((candidate) => candidate.id === id) || available[0];
-  lastDrawnTaskId = task.id;
-  void persistTaskState().catch(() => {});
-  return task;
+  if (cachedTasks.filter((task) => task.pending_sync).length >= MAX_PENDING_PERSONAL_TASKS) {
+    throw new Error('Du hast bereits 10 eigene Offline-Aufgaben vorgemerkt. Bitte synchronisiere sie zuerst.');
+  }
+  return cachePersonalTask(draft, options);
+}
+
+async function replacePendingPersonalTask(pending, synced) {
+  const resolved = { ...synced };
+  cachedTasks = cachedTasks.map((task) => task.id === pending.id ? resolved : task);
+  challengeOptions = challengeOptions.map((task) => task.id === pending.id ? resolved : task);
+  if (currentTask?.id === pending.id) currentTask = resolved;
+  if (selectedTask?.id === pending.id) selectedTask = taskForUpload(resolved);
+  for (const entry of await listOutbox()) {
+    if (entry.task?.id !== pending.id) continue;
+    await updateOutboxEntry(entry.id, {
+      task: taskForUpload(resolved),
+      clientMetadata: { ...entry.clientMetadata, task_id: resolved.id },
+    });
+  }
+  await persistTaskState();
+  if (!$('challenge-panel').hidden && $('challenge-custom-form').hidden) renderChallengeOptions();
+}
+
+async function syncPendingPersonalTasks() {
+  if (taskSyncPromise) return taskSyncPromise;
+  if (offlineMode || navigator.onLine === false || !authenticated || !currentUser) return false;
+  const pendingTasks = cachedTasks.filter((task) => task.pending_sync && OFFLINE_TASK_ID_PATTERN.test(task.id));
+  if (!pendingTasks.length) return true;
+  const sync = (async () => {
+    for (const pending of pendingTasks) {
+      try {
+        const synced = await api('/api/tasks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: pending.text, offline_id: pending.id }),
+        });
+        await replacePendingPersonalTask(pending, synced);
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  })();
+  taskSyncPromise = sync;
+  try {
+    return await sync;
+  } finally {
+    if (taskSyncPromise === sync) taskSyncPromise = null;
+  }
+}
+
+async function synchronizeTaskCache() {
+  const synced = await syncPendingPersonalTasks();
+  if (!authenticated || navigator.onLine === false) return cachedTasks;
+  if (!synced && cachedTasks.some((task) => task.pending_sync)) return cachedTasks;
+  return refreshTaskCache();
 }
 
 async function resumeBlockedOutbox() {
@@ -908,7 +1084,7 @@ async function resumeBlockedOutbox() {
 async function enter(user, { offline = false } = {}) {
   authenticated = true;
   offlineMode = offline;
-  $('boot').hidden = $('login').hidden = $('profile-setup').hidden = true;
+  $('boot').hidden = $('login').hidden = $('blocked').hidden = $('profile-setup').hidden = true;
   showUser(user);
   if (!currentUser) {
     $('upload').hidden = $('gallery').hidden = $('stream').hidden = $('logout').hidden = true;
@@ -925,7 +1101,7 @@ async function enter(user, { offline = false } = {}) {
   void requestPersistentStorage();
   if (!offline) {
     await resumeBlockedOutbox();
-    void refreshTaskCache().catch(() => {});
+    void synchronizeTaskCache().finally(() => scheduleQueueSync());
   }
   $(galleryPage ? 'gallery' : streamPage ? 'stream' : 'upload').hidden = false;
   if (!galleryPage && !streamPage && selected) showReviewShell();
@@ -938,7 +1114,6 @@ async function enter(user, { offline = false } = {}) {
     else await loadStream();
   }
   await refreshOutbox();
-  if (!offline) scheduleQueueSync();
   return true;
 }
 
@@ -952,6 +1127,24 @@ $('login-form').addEventListener('submit', async (event) => {
     if (await enter(result.user)) $(galleryPage ? 'refresh' : streamPage ? 'stream-fullscreen' : 'camera').focus();
   } catch (error) { $('login-error').textContent = error.message; }
   finally { $('login-submit').disabled = false; $('login-submit').textContent = 'Dabei sein →'; }
+});
+
+$('blocked-retry').addEventListener('click', async () => {
+  $('blocked-retry').disabled = true;
+  $('blocked-status').textContent = 'Freigabe wird geprüft …';
+  try {
+    const restored = await api('/api/session/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: deviceId() }),
+    });
+    await enter(restored.user);
+  } catch (error) {
+    if (!error.blocked) $('blocked-status').textContent = error.message;
+    else $('blocked-status').textContent = 'Noch nicht freigegeben. Die Anfrage wurde aktualisiert.';
+  } finally {
+    $('blocked-retry').disabled = false;
+  }
 });
 
 async function completeLogout(deleteQueued) {
@@ -1046,10 +1239,11 @@ $('task-add-form').addEventListener('submit', async (event) => {
   $('task-add-status').textContent = '';
   $('task-add-submit').disabled = true;
   try {
-    await api('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: $('task-add-input').value }) });
-    await refreshTaskCache();
+    const task = await createPersonalTask($('task-add-input').value);
     $('task-add-input').value = '';
-    $('task-add-status').textContent = 'Die Aufgabe ist ab jetzt in der Auswahl.';
+    $('task-add-status').textContent = task.pending_sync
+      ? 'Offline vorgemerkt. Wird automatisch synchronisiert, sobald du wieder Netz hast.'
+      : 'Privat gespeichert. Nur du bekommst diese Aufgabe zur Auswahl.';
   } catch (error) { $('task-add-error').textContent = error.message; }
   finally { $('task-add-submit').disabled = false; }
 });
@@ -1156,6 +1350,41 @@ async function updateAdminRole(user, button, status) {
   }
 }
 
+async function updateAdminAccess(user, button, status) {
+  const desired = !user.blocked;
+  if (desired && !window.confirm(`${user.name} aus der Party entfernen? Dieses Gerät wird gesperrt, bis ein Admin es wieder freigibt.`)) return;
+  button.disabled = true;
+  status.textContent = desired ? 'Gerät wird gesperrt …' : 'Gerät wird freigegeben …';
+  $('admin-error').textContent = '';
+  try {
+    const result = await api(`/api/admin/users/${encodeURIComponent(user.device_id)}/access`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ blocked: desired }),
+    });
+    if (adminData?.users) {
+      adminData.users = adminData.users.map((entry) => entry.device_id === user.device_id
+        ? { ...entry, ...result.user, values: entry.values, photos: entry.photos }
+        : entry);
+      if (!desired) {
+        adminData.join_requests = (adminData.join_requests || [])
+          .filter((request) => request.device_id !== user.device_id);
+      }
+      adminData.values = {
+        ...(adminData.values || {}),
+        blocked: adminData.users.filter((entry) => entry.blocked).length,
+        join_requests: (adminData.join_requests || []).length,
+      };
+      renderAdminUsers(adminData);
+      renderAdminRequests(adminData);
+    }
+  } catch (error) {
+    $('admin-error').textContent = error.message;
+    status.textContent = 'Der Zugang konnte nicht geändert werden.';
+    button.disabled = false;
+  }
+}
+
 function normalizeAdminSearch(value) {
   return String(value || '')
     .normalize('NFD')
@@ -1180,6 +1409,7 @@ function renderAdminUsers(result) {
   summary.append(
     adminMetric('Gäste', visibleUsers.length),
     adminMetric('Admins', visibleUsers.filter((user) => user.is_admin).length),
+    adminMetric('Gesperrt', visibleUsers.filter((user) => user.blocked).length),
     adminMetric('Fotos', visibleUsers.reduce((total, user) => total + (user.photos?.length || 0), 0)),
   );
   summary.hidden = false;
@@ -1203,6 +1433,12 @@ function renderAdminUsers(result) {
       badge.textContent = 'Admin';
       heading.append(badge);
     }
+    if (user.blocked) {
+      const badge = document.createElement('span');
+      badge.className = 'admin-badge admin-blocked-badge';
+      badge.textContent = 'Gesperrt';
+      heading.append(badge);
+    }
     const identifiers = document.createElement('p');
     identifiers.className = 'admin-identifiers';
     identifiers.textContent = `${user.id} · ${user.device_id}`;
@@ -1216,24 +1452,51 @@ function renderAdminUsers(result) {
     );
     const disclosure = document.createElement('span');
     disclosure.className = 'admin-disclosure';
-    disclosure.textContent = `${user.photos?.length || 0} ansehen`;
+    disclosure.textContent = 'Verwalten';
     summaryRow.append(identity, metrics, disclosure);
     group.append(summaryRow);
 
     const content = document.createElement('div');
     content.className = 'admin-user-photos';
+    const controls = document.createElement('div');
+    controls.className = 'admin-user-controls';
+    const accessActions = document.createElement('div');
+    accessActions.className = 'admin-control-row';
+    const accessCopy = document.createElement('div');
+    const accessTitle = document.createElement('strong');
+    accessTitle.textContent = 'Party-Zugang';
+    const accessStatus = document.createElement('span');
+    accessStatus.className = 'admin-role-status';
+    accessStatus.textContent = user.blocked ? 'Dieses Gerät ist gesperrt' : 'Dieses Gerät darf beitreten';
+    accessCopy.append(accessTitle, accessStatus);
+    const accessButton = document.createElement('button');
+    accessButton.type = 'button';
+    accessButton.className = user.blocked ? 'secondary' : 'danger-button';
+    accessButton.textContent = user.blocked ? 'Wieder zulassen' : 'Aus Party entfernen';
+    accessButton.disabled = user.is_admin && !user.blocked;
+    if (accessButton.disabled) accessButton.title = 'Entziehe zuerst die Adminrechte.';
+    accessButton.addEventListener('click', () => updateAdminAccess(user, accessButton, accessStatus));
+    accessActions.append(accessCopy, accessButton);
+
     const roleActions = document.createElement('div');
-    roleActions.className = 'admin-role-actions';
+    roleActions.className = 'admin-control-row';
+    const roleCopy = document.createElement('div');
+    const roleTitle = document.createElement('strong');
+    roleTitle.textContent = 'Berechtigung';
     const roleStatus = document.createElement('span');
     roleStatus.className = 'admin-role-status';
     roleStatus.textContent = user.is_admin ? 'Hat Adminrechte' : 'Gast';
+    roleCopy.append(roleTitle, roleStatus);
     const roleButton = document.createElement('button');
     roleButton.type = 'button';
     roleButton.className = 'secondary';
     roleButton.textContent = user.is_admin ? 'Adminrechte entziehen' : 'Zum Admin machen';
+    roleButton.disabled = user.blocked;
+    if (user.blocked) roleButton.title = 'Gib dieses Gerät zuerst wieder frei.';
     roleButton.addEventListener('click', () => updateAdminRole(user, roleButton, roleStatus));
-    roleActions.append(roleStatus, roleButton);
-    content.append(roleActions);
+    roleActions.append(roleCopy, roleButton);
+    controls.append(accessActions, roleActions);
+    content.append(controls);
     if (!user.photos?.length) {
       const empty = document.createElement('p');
       empty.className = 'admin-user-no-photos';
@@ -1272,6 +1535,65 @@ function renderAdminUsers(result) {
   }
 }
 
+function renderAdminRequests(result) {
+  const requests = result.join_requests || [];
+  const container = $('admin-requests');
+  const badge = $('admin-requests-count');
+  container.replaceChildren();
+  badge.hidden = requests.length === 0;
+  badge.textContent = String(requests.length);
+  $('admin-requests-tab').setAttribute(
+    'aria-label',
+    requests.length
+      ? `Anfragen, ${requests.length} offen`
+      : 'Anfragen, keine offen',
+  );
+  $('admin-requests-empty').hidden = requests.length > 0;
+  $('admin-requests-status').textContent = requests.length
+    ? `${requests.length} ${requests.length === 1 ? 'Gerät wartet' : 'Geräte warten'} auf Freigabe.`
+    : '';
+
+  for (const request of requests) {
+    const user = (result.users || []).find((entry) => entry.device_id === request.device_id)
+      || { ...request, blocked: true, photos: [], values: {} };
+    const item = document.createElement('article');
+    item.className = 'admin-request';
+    const identity = document.createElement('div');
+    identity.className = 'admin-request-identity';
+    const heading = document.createElement('div');
+    heading.className = 'admin-user-heading';
+    const name = document.createElement('h2');
+    name.textContent = request.name;
+    const marker = document.createElement('span');
+    marker.className = 'admin-badge admin-request-badge';
+    marker.textContent = 'Möchte rein';
+    heading.append(name, marker);
+    const identifiers = document.createElement('p');
+    identifiers.className = 'admin-identifiers';
+    identifiers.textContent = `${request.user_id} · ${request.device_id}`;
+    const timing = document.createElement('p');
+    timing.className = 'admin-request-time';
+    const requestedAt = commentDate(request.requested_at);
+    timing.textContent = requestedAt
+      ? `Letzter Versuch: ${requestedAt}`
+      : 'Neuer Beitrittsversuch';
+    identity.append(heading, identifiers, timing);
+    const action = document.createElement('div');
+    action.className = 'admin-request-action';
+    const status = document.createElement('span');
+    status.className = 'admin-role-status';
+    status.textContent = request.attempts > 1 ? `${request.attempts} Anfragen` : '1 Anfrage';
+    const allow = document.createElement('button');
+    allow.type = 'button';
+    allow.className = 'primary';
+    allow.textContent = 'Wieder zulassen';
+    allow.addEventListener('click', () => updateAdminAccess(user, allow, status));
+    action.append(status, allow);
+    item.append(identity, action);
+    container.append(item);
+  }
+}
+
 function renderAdminTasks(tasks) {
   const container = $('admin-tasks');
   container.replaceChildren();
@@ -1279,13 +1601,26 @@ function renderAdminTasks(tasks) {
   for (const task of tasks) {
     const item = document.createElement('article');
     item.className = 'admin-task';
+    item.classList.toggle('is-private', !task.is_public);
     const text = document.createElement('textarea');
     text.value = task.text;
     text.maxLength = 500;
     text.rows = 3;
     text.setAttribute('aria-label', 'Foto-Aufgabe bearbeiten');
-    const meta = document.createElement('code');
-    meta.textContent = task.id;
+    const meta = document.createElement('div');
+    meta.className = 'admin-task-meta';
+    const visibility = document.createElement('span');
+    visibility.className = `admin-task-visibility ${task.is_public ? 'is-public' : 'is-private'}`;
+    visibility.textContent = task.is_public ? 'Öffentlich' : 'Privat';
+    const id = document.createElement('code');
+    id.textContent = task.id;
+    meta.append(visibility, id);
+    if (task.created_by?.name) {
+      const creator = document.createElement('span');
+      creator.className = 'admin-task-creator';
+      creator.textContent = `Von ${task.created_by.name} · ${task.created_by.device_id}`;
+      meta.append(creator);
+    }
     const actions = document.createElement('div');
     actions.className = 'admin-task-actions';
     const save = document.createElement('button');
@@ -1315,6 +1650,22 @@ function renderAdminTasks(tasks) {
         await loadAdminTasks();
       } catch (error) { $('admin-error').textContent = error.message; remove.disabled = false; }
     });
+    if (!task.is_public) {
+      const publish = document.createElement('button');
+      publish.type = 'button';
+      publish.className = 'primary';
+      publish.textContent = 'Veröffentlichen';
+      publish.addEventListener('click', async () => {
+        publish.disabled = true;
+        $('admin-error').textContent = '';
+        try {
+          await api(`/api/admin/tasks/${task.id}/publish`, { method: 'POST' });
+          await refreshTaskCache();
+          await loadAdminTasks();
+        } catch (error) { $('admin-error').textContent = error.message; publish.disabled = false; }
+      });
+      actions.append(publish);
+    }
     actions.append(save, remove);
     item.append(text, meta, actions);
     container.append(item);
@@ -1329,7 +1680,8 @@ async function loadAdminTasks() {
     const result = await api('/api/admin/tasks');
     adminTasks = result.tasks || [];
     renderAdminTasks(adminTasks);
-    $('admin-tasks-status').textContent = `${adminTasks.length} ${adminTasks.length === 1 ? 'Aufgabe' : 'Aufgaben'} verfügbar`;
+    const privateCount = adminTasks.filter((task) => !task.is_public).length;
+    $('admin-tasks-status').textContent = `${adminTasks.length} ${adminTasks.length === 1 ? 'Aufgabe' : 'Aufgaben'} · ${privateCount} privat`;
   } catch (error) {
     $('admin-error').textContent = error.message;
     $('admin-tasks-status').textContent = 'Die Aufgaben konnten nicht geladen werden.';
@@ -1476,9 +1828,9 @@ async function loadAdminStream() {
   }
 }
 
-const ADMIN_TABS = ['users', 'stream', 'tasks'];
+const ADMIN_TABS = ['users', 'requests', 'stream', 'tasks'];
 
-async function setAdminTab(tab) {
+async function setAdminTab(tab, { refresh = true } = {}) {
   adminTab = ADMIN_TABS.includes(tab) ? tab : 'users';
   // Whatever went wrong belonged to the pane being left, so it must not follow
   // the reader into the next one.
@@ -1487,6 +1839,7 @@ async function setAdminTab(tab) {
     $(`admin-${name}-tab`).setAttribute('aria-selected', String(name === adminTab));
     $(`admin-${name}-pane`).hidden = name !== adminTab;
   }
+  if (adminTab === 'requests' && refresh) await loadAdmin();
   if (adminTab === 'tasks') await loadAdminTasks();
   if (adminTab === 'stream') await loadAdminStream();
 }
@@ -1499,7 +1852,9 @@ async function loadAdmin() {
     const result = await api('/api/admin/overview');
     adminData = result;
     renderAdminUsers(result);
-    $('admin-status').textContent = `${result.values?.users || 0} ${result.values?.users === 1 ? 'Person' : 'Personen'} · ${result.values?.photos || 0} Fotos`;
+    renderAdminRequests(result);
+    const blocked = result.values?.blocked || 0;
+    $('admin-status').textContent = `${result.values?.users || 0} ${result.values?.users === 1 ? 'Person' : 'Personen'} · ${result.values?.photos || 0} Fotos${blocked ? ` · ${blocked} gesperrt` : ''}`;
   } catch (error) {
     $('admin-error').textContent = error.message;
     $('admin-status').textContent = 'Die Verwaltung konnte nicht geladen werden.';
@@ -1545,7 +1900,7 @@ $('admin-open').addEventListener('click', async () => {
   $('admin').hidden = false;
   // The heading carries the party totals on every tab, so the overview is
   // always fetched, not only when the guest list happens to be open.
-  await Promise.all([setAdminTab(adminTab), loadAdmin()]);
+  await Promise.all([setAdminTab(adminTab, { refresh: false }), loadAdmin()]);
   $(adminTab === 'users' ? 'admin-back' : `admin-${adminTab}-tab`).focus();
 });
 $('admin-back').addEventListener('click', async () => {
@@ -1559,14 +1914,32 @@ $('admin-back').addEventListener('click', async () => {
 $('camera').addEventListener('click', () => { clearChallenge(false); openCamera(cameraFacing); });
 $('library').addEventListener('click', () => { clearChallenge(false); $('library-input').click(); });
 $('challenge-draw').addEventListener('click', drawChallenge);
-$('challenge-again').addEventListener('click', drawChallenge);
-$('challenge-camera').addEventListener('click', () => openCamera(cameraFacing));
-$('challenge-library').addEventListener('click', () => $('library-input').click());
-$('challenge-cancel').addEventListener('click', () => { clearChallenge(true); $('camera').focus(); });
+$('challenge-refresh').addEventListener('click', drawChallenge);
+$('challenge-custom-open').addEventListener('click', openChallengeCustomForm);
+$('challenge-custom-cancel').addEventListener('click', () => closeChallengeCustomForm(true));
+$('challenge-custom-form').addEventListener('submit', saveCustomChallenge);
+$('challenge-camera').addEventListener('click', () => {
+  if (!currentTask) return;
+  closeChallengePicker(false);
+  openCamera(cameraFacing);
+});
+$('challenge-library').addEventListener('click', () => {
+  if (!currentTask) return;
+  closeChallengePicker(false);
+  $('library-input').click();
+});
+$('challenge-cancel').addEventListener('click', () => clearChallenge(true, true));
+$('challenge-panel').addEventListener('cancel', (event) => {
+  event.preventDefault();
+  clearChallenge(true, true);
+});
+$('challenge-panel').addEventListener('close', () => {
+  document.body.classList.remove('challenge-open');
+});
 $('camera-fallback').addEventListener('click', () => $('camera-input').click());
 $('close-camera').addEventListener('click', () => {
   stopCamera(true);
-  $(currentTask ? 'challenge-camera' : 'camera').focus();
+  if (!currentTask) $('camera').focus();
 });
 $('switch-camera').addEventListener('click', () => {
   cameraFacing = cameraFacing === 'environment' ? 'user' : 'environment';
@@ -1669,18 +2042,158 @@ function stopCamera(showPicker) {
   $('camera-fallback').hidden = true;
   if (showPicker) {
     $('challenge').hidden = false;
-    $('pick-actions').hidden = Boolean(currentTask);
-    $('free-divider').hidden = Boolean(currentTask);
+    if (currentTask && challengeOptions.length) openChallengePicker();
+    else {
+      $('pick-actions').hidden = false;
+      $('free-divider').hidden = false;
+    }
   }
 }
 
-function clearChallenge(showPicker) {
+function openChallengePicker({ focusOptions = true } = {}) {
+  const panel = $('challenge-panel');
+  $('challenge').hidden = false;
+  $('pick-actions').hidden = true;
+  $('free-divider').hidden = true;
+  panel.hidden = false;
+  if (!panel.open) {
+    if (typeof panel.showModal === 'function') panel.showModal();
+    else panel.setAttribute('open', '');
+  }
+  document.body.classList.add('challenge-open');
+  if (!focusOptions) return;
+  requestAnimationFrame(() => {
+    const selectedOption = panel.querySelector('.challenge-option[aria-pressed="true"]');
+    (selectedOption || panel.querySelector('.challenge-option') || $('challenge-cancel')).focus();
+  });
+}
+
+function closeChallengePicker(restoreFocus = true) {
+  const panel = $('challenge-panel');
+  if (panel.open && typeof panel.close === 'function') panel.close();
+  else panel.removeAttribute('open');
+  panel.hidden = true;
+  document.body.classList.remove('challenge-open');
+  if (restoreFocus && !$('challenge-draw').hidden) $('challenge-draw').focus();
+}
+
+function setChallengeSelection(task) {
+  currentTask = task;
+  for (const option of $('challenge-options').querySelectorAll('.challenge-option')) {
+    option.setAttribute('aria-pressed', String(option.dataset.taskId === task.id));
+  }
+  $('challenge-camera').disabled = false;
+  $('challenge-library').disabled = false;
+  $('challenge-selection-status').textContent = `Ausgewählt: ${task.text}`;
+}
+
+function openChallengeCustomForm() {
+  $('challenge-options').hidden = true;
+  $('challenge-custom-form').hidden = false;
+  $('challenge-actions').hidden = true;
+  $('challenge-custom-open').setAttribute('aria-expanded', 'true');
+  $('challenge-custom-error').textContent = '';
+  requestAnimationFrame(() => $('challenge-custom-input').focus());
+}
+
+function closeChallengeCustomForm(restoreFocus = false) {
+  $('challenge-custom-form').hidden = true;
+  $('challenge-options').hidden = false;
+  $('challenge-actions').hidden = false;
+  $('challenge-custom-open').setAttribute('aria-expanded', 'false');
+  $('challenge-custom-error').textContent = '';
+  if (restoreFocus) $('challenge-custom-open').focus();
+}
+
+async function saveCustomChallenge(event) {
+  event.preventDefault();
+  const submit = $('challenge-custom-submit');
+  submit.disabled = true;
+  $('challenge-custom-error').textContent = '';
+  try {
+    const task = await createPersonalTask($('challenge-custom-input').value, { markSeen: true });
+    challengeOptions = [
+      task,
+      ...challengeOptions.filter((candidate) => candidate.id !== task.id),
+    ].slice(0, 4);
+    currentTask = task;
+    $('challenge-custom-input').value = '';
+    closeChallengeCustomForm();
+    renderChallengeOptions();
+    setChallengeSelection(task);
+    $('challenge-selection-status').textContent = task.pending_sync
+      ? `Offline vorgemerkte Aufgabe ausgewählt: ${task.text}`
+      : `Eigene Aufgabe ausgewählt: ${task.text}`;
+    $('challenge-options').querySelector('.challenge-option')?.focus();
+  } catch (error) {
+    $('challenge-custom-error').textContent = error.message;
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+function renderChallengeOptions() {
+  const container = $('challenge-options');
+  container.replaceChildren();
+  container.setAttribute('aria-busy', 'false');
+  container.dataset.count = String(challengeOptions.length);
+  for (const [index, task] of challengeOptions.entries()) {
+    const option = document.createElement('button');
+    option.type = 'button';
+    option.className = 'challenge-option';
+    option.classList.toggle('is-personal', Boolean(task.personal));
+    option.dataset.taskId = task.id;
+    option.setAttribute('aria-pressed', String(currentTask?.id === task.id));
+    if (task.personal) {
+      option.setAttribute(
+        'aria-label',
+        `${task.pending_sync ? 'Eigene Offline-Aufgabe' : 'Eigene Aufgabe'}: ${task.text}`,
+      );
+    }
+    const number = document.createElement('span');
+    number.className = 'challenge-option-number';
+    number.setAttribute('aria-hidden', 'true');
+    number.textContent = task.pending_sync ? 'LOKAL' : task.personal ? 'DEINS' : String(index + 1).padStart(2, '0');
+    const text = document.createElement('span');
+    text.className = 'challenge-option-text';
+    text.textContent = task.text;
+    const check = document.createElement('span');
+    check.className = 'challenge-option-check';
+    check.setAttribute('aria-hidden', 'true');
+    check.textContent = '✓';
+    option.append(number, text, check);
+    option.addEventListener('click', () => setChallengeSelection(task));
+    container.append(option);
+  }
+}
+
+function renderChallengeLoading() {
+  const container = $('challenge-options');
+  container.replaceChildren();
+  container.setAttribute('aria-busy', 'true');
+  container.dataset.count = '4';
+  for (let index = 0; index < 4; index++) {
+    const placeholder = document.createElement('div');
+    placeholder.className = 'challenge-option challenge-option-loading';
+    placeholder.setAttribute('aria-hidden', 'true');
+    placeholder.innerHTML = '<span></span><span></span>';
+    container.append(placeholder);
+  }
+}
+
+function clearChallenge(showPicker, restoreFocus = false) {
   currentTask = null;
-  $('challenge-text').textContent = '';
+  challengeOptions = [];
+  closeChallengeCustomForm();
+  $('challenge-custom-input').value = '';
   $('challenge-error').textContent = '';
-  $('challenge-panel').hidden = true;
+  $('challenge-selection-status').textContent = '';
+  $('challenge-options').replaceChildren();
+  $('challenge-camera').disabled = true;
+  $('challenge-library').disabled = true;
   $('challenge-draw').hidden = false;
   $('active-task').hidden = true;
+  closeChallengePicker(restoreFocus);
   if (showPicker) {
     $('pick-actions').hidden = false;
     $('free-divider').hidden = false;
@@ -1690,28 +2203,39 @@ function clearChallenge(showPicker) {
 async function drawChallenge() {
   if (taskBusy) return;
   taskBusy = true;
-  const previous = currentTask?.id;
+  const previous = challengeOptions.map((task) => task.id);
+  currentTask = null;
   $('challenge-error').textContent = '';
-  $('challenge-draw').disabled = $('challenge-again').disabled = true;
-  $('challenge-draw').querySelector('strong').textContent = 'Aufgabe wird gezogen …';
-  $('challenge-again').textContent = 'Einen Moment …';
+  $('challenge-selection-status').textContent = 'Aufgaben werden geladen.';
+  $('challenge-camera').disabled = true;
+  $('challenge-library').disabled = true;
+  $('challenge-refresh').disabled = true;
+  $('challenge-custom-open').disabled = true;
+  $('challenge-draw').disabled = true;
+  $('challenge-draw').querySelector('strong').textContent = 'Aufgaben werden geladen …';
+  closeChallengeCustomForm();
+  renderChallengeLoading();
+  openChallengePicker({ focusOptions: false });
   try {
     if (!cachedTasks.length && !offlineMode) await refreshTaskCache();
-    currentTask = nextCachedTask(previous);
-    if (!currentTask) throw new Error('Gerade ist keine Foto-Aufgabe verfügbar.');
-    $('challenge-text').textContent = currentTask.text;
-    $('challenge-draw').hidden = true;
-    $('challenge-panel').hidden = false;
-    $('pick-actions').hidden = true;
-    $('free-divider').hidden = true;
-    $('challenge-camera').focus();
+    challengeOptions = nextCachedTasks(4, previous);
+    if (!challengeOptions.length) throw new Error('Gerade ist keine Foto-Aufgabe verfügbar.');
+    renderChallengeOptions();
+    $('challenge-selection-status').textContent = `${challengeOptions.length} Foto-Aufgaben stehen zur Auswahl.`;
+    requestAnimationFrame(() => $('challenge-options').querySelector('.challenge-option')?.focus());
   } catch (error) {
+    challengeOptions = [];
+    $('challenge-options').replaceChildren();
+    $('challenge-options').setAttribute('aria-busy', 'false');
     $('challenge-error').textContent = error.message;
+    $('challenge-selection-status').textContent = '';
+    $('challenge-cancel').focus();
   } finally {
     taskBusy = false;
-    $('challenge-draw').disabled = $('challenge-again').disabled = false;
-    $('challenge-draw').querySelector('strong').textContent = 'Aufgabe ziehen';
-    $('challenge-again').textContent = 'Andere Aufgabe';
+    $('challenge-refresh').disabled = false;
+    $('challenge-custom-open').disabled = false;
+    $('challenge-draw').disabled = false;
+    $('challenge-draw').querySelector('strong').textContent = 'Aufgabe auswählen';
   }
 }
 
@@ -1853,9 +2377,9 @@ function clearSelection() {
   $('preview').removeAttribute('src');
   $('preview').classList.remove('is-mirrored');
   $('preview').hidden = $('review').hidden = $('success').hidden = $('progress-wrap').hidden = true;
+  closeChallengePicker(false);
   $('challenge').hidden = false;
-  $('challenge-draw').hidden = Boolean(currentTask);
-  $('challenge-panel').hidden = !currentTask;
+  $('challenge-draw').hidden = false;
   $('active-task').hidden = true;
   $('preview-task-restore').hidden = true;
   $('pick-actions').hidden = Boolean(currentTask);
@@ -1904,7 +2428,7 @@ async function selectPhoto(file, source = 'library', mirrored = false) {
   if (!file.size) { $('upload-error').textContent = 'Die Datei ist leer. Bitte ein anderes Foto wählen.'; return; }
   selected = file;
   previewMirrored = mirrored;
-  selectedTask = currentTask ? { id: currentTask.id, text: currentTask.text, task_token: currentTask.task_token } : null;
+  selectedTask = taskForUpload(currentTask);
   selectedUploadMetadata = {
     source,
     captured_at: Date.now(),
@@ -1944,10 +2468,10 @@ async function selectPhoto(file, source = 'library', mirrored = false) {
 
 $('discard').addEventListener('click', () => {
   const reopenCamera = selectionSource === 'camera';
-  const focusTarget = currentTask ? 'challenge-camera' : 'camera';
   clearSelection();
   if (reopenCamera) openCamera(cameraFacing);
-  else $(focusTarget).focus();
+  else if (currentTask && challengeOptions.length) openChallengePicker();
+  else $('camera').focus();
 });
 $('another').addEventListener('click', () => { clearSelection(); $('camera').focus(); });
 
@@ -2989,8 +3513,7 @@ window.addEventListener('online', () => {
   updateSendAction();
   void refreshOutbox();
   if (authenticated && !locallySignedOut) {
-    void refreshTaskCache().catch(() => {});
-    scheduleQueueSync();
+    void synchronizeTaskCache().finally(() => scheduleQueueSync());
   }
 });
 
@@ -3001,7 +3524,7 @@ window.addEventListener('offline', () => {
 });
 
 if (!document.querySelector('script[src="/static/dev-reload.js"]') && 'serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+  navigator.serviceWorker.register('/service-worker.js', { updateViaCache: 'none' }).catch(() => {});
   navigator.serviceWorker.addEventListener('message', (event) => {
     if (event.data?.type === 'fotovibe-outbox-updated') void refreshOutbox();
   });
@@ -3014,8 +3537,12 @@ try {
   locallySignedOut = Boolean(await getOfflineState('signed-out'));
   cachedOfflineUser = await getOfflineState('user');
   const taskState = await getOfflineState('tasks');
-  cachedTasks = Array.isArray(taskState?.tasks) ? taskState.tasks.filter((task) => task?.task_token) : [];
+  cachedTasks = Array.isArray(taskState?.tasks) ? taskState.tasks.filter(validCachedTask) : [];
   taskBag = Array.isArray(taskState?.bag) ? taskState.bag.filter((id) => cachedTasks.some((task) => task.id === id)) : [];
+  taskCycleSeen = Array.isArray(taskState?.seen)
+    ? taskState.seen.filter((id) => cachedTasks.some((task) => task.id === id))
+    : [];
+  reconcileTaskCycle();
   lastDrawnTaskId = cachedTasks.some((task) => task.id === taskState?.lastDrawnTaskId) ? taskState.lastDrawnTaskId : null;
   await refreshOutbox();
 } catch {
@@ -3029,7 +3556,9 @@ if (locallySignedOut) {
     const activeSession = await api('/api/session');
     await enter(activeSession.user);
   } catch (error) {
-    if (error.network && cachedOfflineUser) {
+    if (error.blocked) {
+      // api() has already moved the app to the dedicated blocked state.
+    } else if (error.network && cachedOfflineUser) {
       await enter(cachedOfflineUser, { offline: true });
     } else {
       try {
@@ -3041,7 +3570,7 @@ if (locallySignedOut) {
         await enter(restored.user);
       } catch (restoreError) {
         if (restoreError.network && cachedOfflineUser) await enter(cachedOfflineUser, { offline: true });
-        else showLogin(error.status === 401 ? '' : error.message);
+        else if (!restoreError.blocked) showLogin(error.status === 401 ? '' : error.message);
       }
     }
   }

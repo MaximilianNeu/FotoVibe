@@ -10,8 +10,11 @@ choice from the compact header theme button.
 - At least 48px controls, visible keyboard focus, safe-area padding.
 - Photography stays unframed; no decorative cards or stock images.
 - Camera and local preview are focused full-screen states with safe-area-aware controls.
-- The optional photo task is one large inline action before capture. In camera and
-  preview it becomes a compact movable overlay that can be pushed away and restored.
+- The optional photo-task picker presents four large choices over the party image,
+  with compact refresh, personal-task and close controls. In camera and preview the
+  selected wording becomes a compact movable overlay that can be pushed away and restored.
+- Offline personal tasks use the short `LOKAL` marker until background synchronization
+  replaces it with the normal private-task state.
 - Gallery tiles identify challenge photos with a short overlay; the photo detail
   view shows the complete saved task wording.
 - Very brief state transitions, disabled under prefers-reduced-motion.
